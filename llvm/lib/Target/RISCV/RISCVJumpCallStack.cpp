@@ -82,6 +82,13 @@ static cl::opt<std::string> ClJumpCallStackJumpolinePop(
              "it was called"),
     cl::Hidden, cl::init("tcb_jumpoline_pop"));
 
+static cl::opt<bool> ClJumpCallStackAlwaysFixCallers(
+    "jump-call-stack-always-fix-callers",
+    cl::desc("Always check all callers for a <jump-call-stack-postfix> version "
+             "and adjust the call if it is available, even if no functions use "
+             "the Jumpoline."),
+    cl::Hidden, cl::init(false));
+
 namespace {
 
 struct RISCVJumpCallStack : public ModulePass {
@@ -166,18 +173,21 @@ bool RISCVJumpCallStack::runOnModule(Module &M) {
   MachineModuleInfo &MMI = getAnalysis<MachineModuleInfoWrapperPass>().getMMI();
 
   bool Changed = false;
+  bool DefinitelyHasPostjump = false;
 
   for (Function &F : M.functions()) {
     MachineFunction *MaybeMF = MMI.getMachineFunction(F);
     if (!MaybeMF)
       continue;
     CallStackMethod CSM = getFunctionCSM(F);
+    DefinitelyHasPostjump |= CSM == JCS_Jump;
     if (CSM == JCS_None)
       continue;
     bool NewChanged = this->runExpandPEOnMachineFunction(*MaybeMF, CSM);
     Changed |= NewChanged;
   }
 
+  if (DefinitelyHasPostjump || ClJumpCallStackAlwaysFixCallers) {
   for (Function &F : M.functions()) {
     MachineFunction *MaybeMF = MMI.getMachineFunction(F);
     if (!MaybeMF)
@@ -185,12 +195,6 @@ bool RISCVJumpCallStack::runOnModule(Module &M) {
     bool NewChanged = this->runFixCallOnMachineFunction(*MaybeMF);
     Changed |= NewChanged;
   }
-
-  for (Function &F : M.functions()) {
-    MachineFunction *MaybeMF = MMI.getMachineFunction(F);
-    if (!MaybeMF)
-      continue;
-    this->runVerifyCallOnMachineFunction(*MaybeMF);
   }
 
   return Changed;
