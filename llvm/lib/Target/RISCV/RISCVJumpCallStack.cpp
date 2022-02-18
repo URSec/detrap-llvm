@@ -145,18 +145,20 @@ private:
 
 } // end anonymous namespace
 
-static StringRef getOperandName(MachineOperand &MO,
-                                bool AllowNonzeroOffset = false) {
+static const GlobalValue *getGlobalValue(const MachineOperand &MO) {
   if (MO.isGlobal()) {
-    if (AllowNonzeroOffset || MO.getOffset() == 0) {
-      const GlobalValue *GV = MO.getGlobal();
-      if (GV)
-        return GV->getName();
-    }
-  } else if (MO.isSymbol()) {
-    if (AllowNonzeroOffset || MO.getOffset() == 0) {
+    return MO.getGlobal();
+  }
+  return nullptr;
+}
+
+static StringRef getOperandName(const MachineOperand &MO,
+                                bool AllowNonzeroOffset = false) {
+  if (AllowNonzeroOffset || MO.getOffset() == 0) {
+    if (const GlobalValue *GV = getGlobalValue(MO))
+      return GV->getName();
+    if (MO.isSymbol())
       return MO.getSymbolName();
-    }
   }
   return StringRef();
 }
@@ -188,13 +190,13 @@ bool RISCVJumpCallStack::runOnModule(Module &M) {
   }
 
   if (DefinitelyHasPostjump || ClJumpCallStackAlwaysFixCallers) {
-  for (Function &F : M.functions()) {
-    MachineFunction *MaybeMF = MMI.getMachineFunction(F);
-    if (!MaybeMF)
-      continue;
-    bool NewChanged = this->runFixCallOnMachineFunction(*MaybeMF);
-    Changed |= NewChanged;
-  }
+    for (Function &F : M.functions()) {
+      MachineFunction *MaybeMF = MMI.getMachineFunction(F);
+      if (!MaybeMF)
+        continue;
+      bool NewChanged = this->runFixCallOnMachineFunction(*MaybeMF);
+      Changed |= NewChanged;
+    }
   }
 
   return Changed;
@@ -402,6 +404,7 @@ bool RISCVJumpCallStack::expandMI(MachineBasicBlock &MBB,
   switch (MBBI->getOpcode()) {
   case RISCV::PseudoCALL:
     return expandCall(MBB, MBBI, NextMBBI, MORE);
+    // TODO:  PseudoCALLReg?
   }
   return false;
 }
@@ -536,4 +539,47 @@ void RISCVJumpCallStack::runVerifyCallOnMachineFunction(MachineFunction &MF) {
 /// Returns an instance of the Merge Base Offset Optimization pass.
 ModulePass *llvm::createRISCVJumpCallStackPass() {
   return new RISCVJumpCallStack();
+}
+
+unsigned llvm::getJCSPseudoCallSizeInBytes(const MachineInstr &MI) {
+  unsigned Ret = 8;
+  switch (MI.getOpcode()) {
+  default:
+    report_fatal_error("Unsupported Opcode for getJCSPseudoCallSizeInBytes");
+  // TODO: PseudoCALLReg?
+  case RISCV::PseudoCALL: {
+    const auto &MO = MI.getOperand(0);
+    if (const auto *DestFcn = dyn_cast_or_null<Function>(getGlobalValue(MO))) {
+      if (DestFcn->hasFnAttribute("jump-call-stack")) {
+        if (DestFcn->getFnAttribute("jump-call-stack")
+                .getValueAsString()
+                .equals("jump")) {
+          Ret = 16;
+        }
+      }
+      // No JCS -- leave at default
+      break;
+    }
+    auto OpName = getOperandName(MO);
+    if (OpName.empty())
+      break;
+    auto &MC = MI.getMF()->getContext();
+    if (MC.lookupSymbol(getNewDestinationName(OpName))) {
+      Ret = 16;
+      break;
+    }
+    if (MC.lookupSymbol(OpName)) {
+      MC.reportWarning(
+          SMLoc(),
+          "Assuming destination function will not get JCS treatment: " +
+              OpName);
+      Ret = 8;
+      break;
+    }
+    MC.reportWarning(SMLoc(), "Unable to find destination function: " + OpName);
+    Ret = 16;
+    break;
+  }
+  }
+  return Ret;
 }

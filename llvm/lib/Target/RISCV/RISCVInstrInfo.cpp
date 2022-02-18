@@ -1051,6 +1051,12 @@ unsigned RISCVInstrInfo::getInstSizeInBytes(const MachineInstr &MI) const {
     if (isCompressibleInst(MI, &ST, MRI, STI))
       return 2;
   }
+
+  //TODO: also modify PseudoCALLReg with JCS?
+  if (Opcode == TargetOpcode::PseudoCALL)
+    // Due to JumpCallStack, these might be doubled
+    return getJCSPseudoCallSizeInBytes(MI);
+
   return get(Opcode).getSize();
 }
 
