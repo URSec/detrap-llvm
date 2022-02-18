@@ -65,6 +65,9 @@ void initializeRISCVInsertVSETVLIPass(PassRegistry &);
 FunctionPass *createRISCVRedundantCopyEliminationPass();
 void initializeRISCVRedundantCopyEliminationPass(PassRegistry &);
 
+ModulePass *createRISCVJumpCallStackPass();
+void initializeRISCVJumpCallStackPass(PassRegistry &);
+
 InstructionSelector *createRISCVInstructionSelector(const RISCVTargetMachine &,
                                                     RISCVSubtarget &,
                                                     RISCVRegisterBankInfo &);

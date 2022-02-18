@@ -389,6 +389,79 @@ void RISCVFrameLowering::adjustStackForRVV(MachineFunction &MF,
       .setMIFlag(Flag);
 }
 
+static void emitJCSPrologue(MachineFunction &MF, MachineBasicBlock &MBB,
+                            MachineBasicBlock::iterator MI,
+                            const DebugLoc &DL) {
+  if (!(MF.getFunction().hasFnAttribute("jump-call-stack")))
+    return;
+
+  const auto &STI = MF.getSubtarget<RISCVSubtarget>();
+  Register RAReg = STI.getRegisterInfo()->getRARegister();
+
+  // Do not save RA to the JCS if it's not saved to the regular stack,
+  // i.e. RA is not at risk of being overwritten.
+  std::vector<CalleeSavedInfo> &CSI = MF.getFrameInfo().getCalleeSavedInfo();
+  if (std::none_of(CSI.begin(), CSI.end(),
+                   [&](CalleeSavedInfo &CSR) { return CSR.getReg() == RAReg; }))
+    return;
+
+  auto &Ctx = MF.getFunction().getContext();
+  const auto *RVFI = MF.getInfo<RISCVMachineFunctionInfo>();
+  if (RVFI->useSaveRestoreLibCalls(MF)) {
+    Ctx.diagnose(DiagnosticInfoUnsupported{
+        MF.getFunction(),
+        "Jump Call Stack cannot be combined with Save/Restore LibCalls."});
+    return;
+  }
+
+  // TODO: mark RA as already saved, and not for saving to the stack
+
+  const RISCVInstrInfo *TII = STI.getInstrInfo();
+  // Insert NOP placeholder to tell RISCVJumpCallStackPass to work here
+  BuildMI(MBB, MI, DL, TII->get(RISCV::ADDI))
+      .addReg(RISCV::X0)
+      .addReg(RISCV::X0)
+      .addImm(0)
+      .setMIFlag(MachineInstr::FrameSetup)
+      .addMetadata(MDTuple::get(
+          Ctx, {MDString::get(Ctx, "JumpCallStackInlineCallStack")}));
+}
+
+static void emitJCSEpilogue(MachineFunction &MF, MachineBasicBlock &MBB,
+                            MachineBasicBlock::iterator MI,
+                            const DebugLoc &DL) {
+  if (!(MF.getFunction().hasFnAttribute("jump-call-stack")))
+    return;
+
+  const auto &STI = MF.getSubtarget<RISCVSubtarget>();
+  Register RAReg = STI.getRegisterInfo()->getRARegister();
+
+  // See emitJCSPrologue() above.
+  std::vector<CalleeSavedInfo> &CSI = MF.getFrameInfo().getCalleeSavedInfo();
+  if (std::none_of(CSI.begin(), CSI.end(),
+                   [&](CalleeSavedInfo &CSR) { return CSR.getReg() == RAReg; }))
+    return;
+
+  auto &Ctx = MF.getFunction().getContext();
+  const auto *RVFI = MF.getInfo<RISCVMachineFunctionInfo>();
+  if (RVFI->useSaveRestoreLibCalls(MF)) {
+    Ctx.diagnose(DiagnosticInfoUnsupported{
+        MF.getFunction(),
+        "Jump Call Stack cannot be combined with Save/Restore LibCalls."});
+    return;
+  }
+
+  // Insert NOP placeholder to tell RISCVJumpCallStackPass to work here
+  const RISCVInstrInfo *TII = STI.getInstrInfo();
+  BuildMI(MBB, MI, DL, TII->get(RISCV::ADDI))
+      .addReg(RISCV::X0)
+      .addReg(RISCV::X0)
+      .addImm(0)
+      .setMIFlag(MachineInstr::FrameDestroy)
+      .addMetadata(MDTuple::get(
+          Ctx, {MDString::get(Ctx, "JumpCallStackInlineCallStack")}));
+}
+
 void RISCVFrameLowering::emitPrologue(MachineFunction &MF,
                                       MachineBasicBlock &MBB) const {
   MachineFrameInfo &MFI = MF.getFrameInfo();
@@ -412,6 +485,9 @@ void RISCVFrameLowering::emitPrologue(MachineFunction &MF,
 
   // Emit prologue for shadow call stack.
   emitSCSPrologue(MF, MBB, MBBI, DL);
+
+  // Emit prologue for jump call stack.
+  emitJCSPrologue(MF, MBB, MBBI, DL);
 
   // Since spillCalleeSavedRegisters may have inserted a libcall, skip past
   // any instructions marked as FrameSetup
@@ -673,6 +749,9 @@ void RISCVFrameLowering::emitEpilogue(MachineFunction &MF,
 
   // Deallocate stack
   adjustReg(MBB, MBBI, DL, SPReg, SPReg, StackSize, MachineInstr::FrameDestroy);
+
+  // Emit epilogue for jump call stack.
+  emitJCSEpilogue(MF, MBB, MBBI, DL);
 
   // Emit epilogue for shadow call stack.
   emitSCSEpilogue(MF, MBB, MBBI, DL);

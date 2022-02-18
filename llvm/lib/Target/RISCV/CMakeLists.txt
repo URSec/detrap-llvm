@@ -32,6 +32,7 @@ add_llvm_target(RISCVCodeGen
   RISCVInstructionSelector.cpp
   RISCVISelDAGToDAG.cpp
   RISCVISelLowering.cpp
+  RISCVJumpCallStack.cpp
   RISCVLegalizerInfo.cpp
   RISCVMachineFunctionInfo.cpp
   RISCVMacroFusion.cpp

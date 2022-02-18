@@ -482,6 +482,14 @@ llvm::Function *CodeGenModule::CreateGlobalInitOrCleanUpFunction(
       !isInNoSanitizeList(SanitizerKind::ShadowCallStack, Fn, Loc))
     Fn->addFnAttr(llvm::Attribute::ShadowCallStack);
 
+  if (getLangOpts().Sanitize.has(SanitizerKind::JumpCallStack) &&
+      !isInNoSanitizeList(SanitizerKind::JumpCallStack, Fn, Loc))
+    Fn->addFnAttr("jump-call-stack", "jump");
+
+  if (getLangOpts().Sanitize.has(SanitizerKind::InlineCallStack) &&
+      !isInNoSanitizeList(SanitizerKind::InlineCallStack, Fn, Loc))
+    Fn->addFnAttr("jump-call-stack", "inline");
+
   return Fn;
 }
 

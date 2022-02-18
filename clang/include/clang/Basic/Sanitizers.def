@@ -133,6 +133,12 @@ SANITIZER("safe-stack", SafeStack)
 // Shadow Call Stack
 SANITIZER("shadow-call-stack", ShadowCallStack)
 
+// Jump Call Stack
+SANITIZER("jump-call-stack", JumpCallStack)
+
+// Inline Call Stack (like Jump Call Stack, but no jumping)
+SANITIZER("inline-call-stack", InlineCallStack)
+
 // -fsanitize=undefined includes all the sanitizers which have low overhead, no
 // ABI or address space layout implications, and only catch undefined behavior.
 SANITIZER_GROUP("undefined", Undefined,
