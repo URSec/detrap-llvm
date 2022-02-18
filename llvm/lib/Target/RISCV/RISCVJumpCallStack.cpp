@@ -85,7 +85,6 @@ static cl::opt<std::string> ClJumpCallStackJumpolinePop(
 namespace {
 
 struct RISCVJumpCallStack : public ModulePass {
-  const RISCVInstrInfo *TII;
   static char ID;
   bool runOnModule(Module &M) override;
   RISCVJumpCallStack() : ModulePass(ID) {}
@@ -120,7 +119,7 @@ private:
     return JCS_None;
   }
 
-  bool runFixLabelOnMachineFunction(MachineFunction &Fn, CallStackMethod CSM);
+  bool runExpandPEOnMachineFunction(MachineFunction &Fn, CallStackMethod CSM);
   bool runFixCallOnMachineFunction(MachineFunction &Fn);
   void runVerifyCallOnMachineFunction(MachineFunction &Fn);
   bool expandCall(MachineBasicBlock &MBB, MachineBasicBlock::iterator MBBI,
@@ -131,6 +130,10 @@ private:
                 MachineOptimizationRemarkEmitter &MORE);
   bool expandMBB(MachineBasicBlock &MBB,
                  MachineOptimizationRemarkEmitter &MORE);
+
+  void insertJCSInline(MachineBasicBlock::iterator &MBBI);
+  void insertJCSJump(MachineBasicBlock::iterator &MBBI);
+  void insertJCSEpilogue(MachineBasicBlock::iterator &MBBI);
 };
 
 } // end anonymous namespace
@@ -171,7 +174,7 @@ bool RISCVJumpCallStack::runOnModule(Module &M) {
     CallStackMethod CSM = getFunctionCSM(F);
     if (CSM == JCS_None)
       continue;
-    bool NewChanged = this->runFixLabelOnMachineFunction(*MaybeMF, CSM);
+    bool NewChanged = this->runExpandPEOnMachineFunction(*MaybeMF, CSM);
     Changed |= NewChanged;
   }
 
@@ -193,146 +196,174 @@ bool RISCVJumpCallStack::runOnModule(Module &M) {
   return Changed;
 }
 
-static bool findInstrumentNOP(MachineInstr &MI, MachineInstr::MIFlag Flag) {
-  int CurOp = 0;
-  if (MI.getFlag(Flag))
-    for (MachineOperand &MO : MI.operands()) {
-      if (MO.isMetadata()) {
-        auto *MDN = MO.getMetadata();
-        for (const MDOperand &MDO : MDN->operands()) {
-          if (auto *MDS = dyn_cast_or_null<MDString>(MDO.get())) {
-            if (MDS->getString().equals("JumpCallStackInlineCallStack")) {
-              MI.RemoveOperand(CurOp);
-              return true;
-            }
+static bool findInstrumentNOP(MachineInstr &MI) {
+  for (auto *MOI = MI.operands_begin(); MOI != MI.operands_end(); MOI++) {
+    if (MOI->isMetadata()) {
+      auto *MDN = MOI->getMetadata();
+      for (const MDOperand &MDO : MDN->operands()) {
+        if (auto *MDS = dyn_cast_or_null<MDString>(MDO.get())) {
+          if (MDS->getString().equals("JumpCallStackInlineCallStack")) {
+            return true;
           }
         }
       }
-      CurOp++;
     }
+  }
   return false;
 }
 
-static MachineBasicBlock::iterator
-findInstrumentNOP(MachineBasicBlock &MBB, MachineInstr::MIFlag Flag) {
+static bool findInstrumentNOP(MachineInstr &MI, uint_least16_t Flags) {
+  auto MIFlags = MI.getFlags();
+  static_assert(sizeof(Flags) >= sizeof(MIFlags), "Flags too small");
+  if (MIFlags & Flags || !Flags)
+    return findInstrumentNOP(MI);
+  return false;
+}
+
+static MachineBasicBlock::iterator findInstrumentNOP(MachineBasicBlock &MBB,
+                                                     uint_least16_t Flags) {
   for (auto MBBI = MBB.begin(); MBBI != MBB.end(); MBBI++) {
-    if (findInstrumentNOP(*MBBI, Flag)) {
+    if (findInstrumentNOP(*MBBI, Flags)) {
       return MBBI;
     }
   }
   return MBB.end();
 }
 
-// Fixup prologue and epilogue according to CallStackMethod
-bool RISCVJumpCallStack::runFixLabelOnMachineFunction(MachineFunction &MF,
-                                                      CallStackMethod CSM) {
-  TII = static_cast<const RISCVInstrInfo *>(MF.getSubtarget().getInstrInfo());
-  bool Modified = false;
-  Function &F = MF.getFunction();
+void RISCVJumpCallStack::insertJCSJump(MachineBasicBlock::iterator &MBBI) {
+  auto &MBB = *MBBI->getParent();
+  auto &MF = *MBB.getParent();
+  auto *TII =
+      static_cast<const RISCVInstrInfo *>(MF.getSubtarget().getInstrInfo());
   MachineOptimizationRemarkEmitter MORE(MF, nullptr);
+  auto &F = MF.getFunction();
+  auto &DL = MBBI->getDebugLoc();
+  if (!(F.hasExternalLinkage() || F.hasAddressTaken() || F.isWeakForLinker())) {
+    MachineOptimizationRemark R(DEBUG_TYPE, "JumpCallStackRenamed", DL, &MBB);
+    R << "Renamed " << MF.getName() << " because all callers use jumpoline";
+    MORE.emit(R);
+    F.setName(getNewDestinationName(MF.getName()));
+  } else {
+    // Store return address to jump call stack
+    // call t0, __tcb_jumpoline_pop
+    MachineOptimizationRemark R(DEBUG_TYPE, "JumpCallStackAdded", DL, &MBB);
+    R << "Added jumpoline jump and label to " << MF.getName();
+    MORE.emit(R);
+    BuildMI(MBB, MBBI, DL, TII->get(RISCV::PseudoCALLReg))
+        .addReg(RISCV::X5)
+        .addExternalSymbol(ClJumpCallStackJumpolinePop.c_str(),
+                           RISCVII::MO_CALL)
+        .setMIFlag(MachineInstr::FrameSetup);
+    MCSymbol *Label =
+        MF.getContext().getOrCreateSymbol(getNewDestinationName(MF.getName()));
+    if (MF.getFunction().hasExternalLinkage()) {
+      if (auto *ELFLabel = dyn_cast<MCSymbolELF>(Label)) {
+        if (MF.getFunction().isWeakForLinker()) {
+          ELFLabel->setBinding(ELF::STB_WEAK);
+        } else {
+          ELFLabel->setBinding(ELF::STB_GLOBAL);
+        }
+      }
+    }
+    BuildMI(MBB, MBBI, DL, TII->get(RISCV::EH_LABEL))
+        .addSym(Label)
+        .setMIFlag(MachineInstr::FrameSetup);
+  }
+}
+
+void RISCVJumpCallStack::insertJCSInline(MachineBasicBlock::iterator &MBBI) {
+  auto &MBB = *MBBI->getParent();
+  auto &MF = *MBB.getParent();
+  auto *TII =
+      static_cast<const RISCVInstrInfo *>(MF.getSubtarget().getInstrInfo());
+  MachineOptimizationRemarkEmitter MORE(MF, nullptr);
+  auto &DL = MBBI->getDebugLoc();
   const auto &STI = MF.getSubtarget<RISCVSubtarget>();
   Register RAReg = STI.getRegisterInfo()->getRARegister();
   Register SPReg = RISCV::X2;
   Register TReg = RISCV::X7;
   bool IsRV64 = STI.hasFeature(RISCV::Feature64Bit);
+  MachineOptimizationRemark R(DEBUG_TYPE, "InlineCallStackSaved", DL, &MBB);
+  R << "Inlined RA Save in " << MF.getName();
+  MORE.emit(R);
+  BuildMI(MBB, MBBI, DL, TII->get(RISCV::LUI), TReg)
+      .addExternalSymbol(ClJumpInlineCallStackPointerOffset.c_str(),
+                         RISCVII::MO_HI);
+  BuildMI(MBB, MBBI, DL, TII->get(RISCV::ADD))
+      .addReg(TReg)
+      .addReg(TReg)
+      .addReg(SPReg);
+  BuildMI(MBB, MBBI, DL, TII->get(IsRV64 ? RISCV::SD : RISCV::SW))
+      .addReg(RAReg)
+      .addReg(TReg)
+      .addExternalSymbol(ClJumpInlineCallStackPointerOffset.c_str(),
+                         RISCVII::MO_LO);
+}
+
+void RISCVJumpCallStack::insertJCSEpilogue(MachineBasicBlock::iterator &MBBI) {
+  auto &MBB = *MBBI->getParent();
+  auto &MF = *MBB.getParent();
+  auto *TII =
+      static_cast<const RISCVInstrInfo *>(MF.getSubtarget().getInstrInfo());
+  MachineOptimizationRemarkEmitter MORE(MF, nullptr);
+  auto &DL = MBBI->getDebugLoc();
+  const auto &STI = MF.getSubtarget<RISCVSubtarget>();
+  Register RAReg = STI.getRegisterInfo()->getRARegister();
+  Register SPReg = RISCV::X2;
+  Register TReg = RISCV::X7;
+  bool IsRV64 = STI.hasFeature(RISCV::Feature64Bit);
+  MachineOptimizationRemark R(DEBUG_TYPE, "JumpCallStackRestored", DL, &MBB);
+  R << "Added RA restore to " << MF.getName();
+  MORE.emit(R);
+  BuildMI(MBB, MBBI, DL, TII->get(RISCV::LUI), TReg)
+      .addExternalSymbol(ClJumpInlineCallStackPointerOffset.c_str(),
+                         RISCVII::MO_HI)
+      .setMIFlag(MachineInstr::FrameDestroy);
+  BuildMI(MBB, MBBI, DL, TII->get(RISCV::ADD), TReg)
+      .addReg(TReg)
+      .addReg(SPReg)
+      .setMIFlag(MachineInstr::FrameDestroy);
+  BuildMI(MBB, MBBI, DL, TII->get(IsRV64 ? RISCV::LD : RISCV::LW), RAReg)
+      .addReg(TReg, RegState::Kill)
+      .addExternalSymbol(ClJumpInlineCallStackPointerOffset.c_str(),
+                         RISCVII::MO_LO)
+      .setMIFlag(MachineInstr::FrameDestroy);
+}
+
+// Fixup prologue and epilogue according to CallStackMethod
+bool RISCVJumpCallStack::runExpandPEOnMachineFunction(MachineFunction &MF,
+                                                      CallStackMethod CSM) {
+  bool Modified = false;
   auto MFI = MF.begin();
-  for (; MFI != MF.end(); MFI++) {
+  for (; (MFI != MF.end()); MFI++) {
     auto &MBB = *MFI;
-    MachineBasicBlock::iterator MBBI =
-        findInstrumentNOP(MBB, MachineInstr::MIFlag::FrameSetup);
-    if (MBBI == MBB.end())
-      continue;
-    const DebugLoc &DL = MBBI->getDebugLoc();
-    switch (CSM) {
-    default:
-      report_fatal_error("RISCVJumpCallStack: Unsupported CallStackMethod");
-      break;
-    case JCS_Inline: {
-      MachineOptimizationRemark R(DEBUG_TYPE, "InlineCallStackSaved", DL, &MBB);
-      R << "Inlined RA Save in " << MF.getName();
-      MORE.emit(R);
-      const auto &STI = MF.getSubtarget<RISCVSubtarget>();
-      BuildMI(MBB, MBBI, DL, TII->get(RISCV::LUI), TReg)
-          .addExternalSymbol(ClJumpInlineCallStackPointerOffset.c_str(),
-                             RISCVII::MO_HI);
-      BuildMI(MBB, MBBI, DL, TII->get(RISCV::ADD))
-          .addReg(TReg)
-          .addReg(TReg)
-          .addReg(SPReg);
-      BuildMI(MBB, MBBI, DL, TII->get(IsRV64 ? RISCV::SD : RISCV::SW))
-          .addReg(STI.getRegisterInfo()->getRARegister())
-          .addReg(TReg)
-          .addExternalSymbol(ClJumpInlineCallStackPointerOffset.c_str(),
-                             RISCVII::MO_LO);
-      break;
-    }
-    case JCS_Jump:
-      if (!(F.hasExternalLinkage() || F.hasAddressTaken() ||
-            F.isWeakForLinker())) {
-        MachineOptimizationRemark R(DEBUG_TYPE, "JumpCallStackRenamed", DL,
-                                    &MBB);
-        R << "Renamed " << MF.getName() << " because all callers use jumpoline";
-        MORE.emit(R);
-        F.setName(getNewDestinationName(MF.getName()));
-      } else {
-        // Store return address to jump call stack
-        // call t0, __tcb_jumpoline_pop
-        BuildMI(MBB, MBBI, DL, TII->get(RISCV::PseudoCALLReg))
-            .addReg(RISCV::X5)
-            .addExternalSymbol(ClJumpCallStackJumpolinePop.c_str(),
-                               RISCVII::MO_CALL)
-            .setMIFlag(MachineInstr::FrameSetup);
-        MCSymbol *Label = MF.getContext().getOrCreateSymbol(
-            getNewDestinationName(MF.getName()));
-        if (MF.getFunction().hasExternalLinkage()) {
-          if (auto *ELFLabel = dyn_cast<MCSymbolELF>(Label)) {
-            if (MF.getFunction().isWeakForLinker()) {
-              ELFLabel->setBinding(ELF::STB_WEAK);
-            } else {
-              ELFLabel->setBinding(ELF::STB_GLOBAL);
-            }
-          }
+    auto GetMBBI = [&] {
+      return findInstrumentNOP(MBB, MachineInstr::MIFlag::FrameSetup |
+                                        MachineInstr::MIFlag::FrameDestroy);
+    };
+    for (MachineBasicBlock::iterator MBBI = GetMBBI(); MBBI != MBB.end();
+         MBBI = GetMBBI()) {
+      if (MBBI->getFlag(MachineInstr::MIFlag::FrameSetup)) {
+        switch (CSM) {
+        default:
+          report_fatal_error("RISCVJumpCallStack: Unsupported CallStackMethod");
+          break;
+        case JCS_Inline:
+          insertJCSInline(MBBI);
+          break;
+        case JCS_Jump:
+          insertJCSJump(MBBI);
+          break;
         }
-        BuildMI(MBB, MBBI, DL, TII->get(RISCV::EH_LABEL))
-            .addSym(Label)
-            .setMIFlag(MachineInstr::FrameSetup);
+      } else if (MBBI->getFlag(MachineInstr::MIFlag::FrameDestroy)) {
+        insertJCSEpilogue(MBBI);
+      } else {
+        report_fatal_error("RISCVJumpCallStack: Got a "
+                           "JumpCallStackInlineCallStack without a known flag");
       }
-      break;
+      MBBI->eraseFromParent();
+      Modified = true;
     }
-    MBBI->eraseFromParent();
-    Modified = true;
-    break;
-  }
-  for (; MFI != MF.end(); MFI++) {
-    auto &MBB = *MFI;
-    MachineBasicBlock::iterator MBBI =
-        findInstrumentNOP(MBB, MachineInstr::MIFlag::FrameDestroy);
-    if (MBBI == MBB.end())
-      continue;
-    const DebugLoc &DL = MBBI->getDebugLoc();
-    // // Load return address from jump call stack
-    // // lui     t2, %hi(__tcb_sp_offset)
-    // // add     t2, t2, sp
-    // // l[w|d]  ra, %lo(__tcb_sp_offset)(t2)
-    BuildMI(MBB, MBBI, DL, TII->get(RISCV::LUI))
-        .addReg(TReg, RegState::Define)
-        .addExternalSymbol(ClJumpInlineCallStackPointerOffset.c_str(),
-                           RISCVII::MO_HI)
-        .setMIFlag(MachineInstr::FrameDestroy);
-    BuildMI(MBB, MBBI, DL, TII->get(RISCV::ADD))
-        .addReg(TReg)
-        .addReg(TReg)
-        .addReg(SPReg)
-        .setMIFlag(MachineInstr::FrameDestroy);
-    BuildMI(MBB, MBBI, DL, TII->get(IsRV64 ? RISCV::LD : RISCV::LW))
-        .addReg(RAReg)
-        .addReg(TReg)
-        .addExternalSymbol(ClJumpInlineCallStackPointerOffset.c_str(),
-                           RISCVII::MO_LO)
-        .setMIFlag(MachineInstr::FrameDestroy);
-    MBBI->eraseFromParent();
-    Modified = true;
-    break;
   }
   return Modified;
 }
@@ -377,13 +408,15 @@ bool RISCVJumpCallStack::expandCall(MachineBasicBlock &MBB,
                                     MachineOptimizationRemarkEmitter &MORE) {
   static const unsigned OperandNo = 0;
   MachineFunction *MF = MBB.getParent();
+  auto *TII =
+      static_cast<const RISCVInstrInfo *>(MF->getSubtarget().getInstrInfo());
   MachineInstr &MI = *MBBI;
   MachineOperand &MO = MI.getOperand(OperandNo);
   DebugLoc DL = MI.getDebugLoc();
   StringRef OrigName = getOperandName(MO);
   MCContext &MC = MF->getContext();
   if (OrigName.empty()) {
-    MachineOptimizationRemarkMissed R(DEBUG_TYPE, "NotFixedEmpty", DL, &MBB);
+    MachineOptimizationRemark R(DEBUG_TYPE, "NotFixedEmpty", DL, &MBB);
     SmallString<128> SS;
     raw_svector_ostream OS(SS);
     OS << MO << "(" << (int)MO.getType();
@@ -397,7 +430,7 @@ bool RISCVJumpCallStack::expandCall(MachineBasicBlock &MBB,
     NewName = getNewDestinationName(OrigName).str();
     DestSym = MC.lookupSymbol(NewName);
     if (!DestSym) {
-      MachineOptimizationRemarkMissed R(DEBUG_TYPE, "NotFixedNoDest", DL, &MBB);
+      MachineOptimizationRemark R(DEBUG_TYPE, "NotFixedNoDest", DL, &MBB);
       R << "Not fixing [no DestSym=" << NewName << "] from " << OrigName;
       MORE.emit(R);
       // no rewrite symbol; just continue
@@ -405,9 +438,8 @@ bool RISCVJumpCallStack::expandCall(MachineBasicBlock &MBB,
     }
     if (auto *ELFLabel = dyn_cast<MCSymbolELF>(DestSym)) {
       if (ELFLabel->getBinding() == ELF::STB_WEAK) {
-        MachineOptimizationRemarkMissed R(DEBUG_TYPE, "NotFixedDestWeak", DL,
-                                          &MBB);
-        R << "Ignoring rename for weak binding of " << NewName << "\n";
+        MachineOptimizationRemark R(DEBUG_TYPE, "NotFixedDestWeak", DL, &MBB);
+        R << "Ignoring rename for weak binding of " << NewName;
         MORE.emit(R);
         return false;
       }
@@ -425,8 +457,8 @@ bool RISCVJumpCallStack::expandCall(MachineBasicBlock &MBB,
 
   MachineBasicBlock *NewMBB = MF->CreateMachineBasicBlock(MBB.getBasicBlock());
 
-  // Tell AsmPrinter that we unconditionally want the symbol of this label to
-  // be emitted.
+  // Tell AsmPrinter that we unconditionally want the symbol of this label
+  // to be emitted.
   NewMBB->setLabelMustBeEmitted();
 
   MF->insert(++MBB.getIterator(), NewMBB);
@@ -440,13 +472,13 @@ bool RISCVJumpCallStack::expandCall(MachineBasicBlock &MBB,
 
     FirstMI.addExternalSymbol(DestSym->getName().data(), RISCVII::MO_PCREL_HI);
     MachineOptimizationRemark R(DEBUG_TYPE, "FixedLabel", DL, &MBB);
-    R << "Fixing reference from " << OrigName << " to " << NewName << "\n";
+    R << "Fixing reference from " << OrigName << " to " << NewName;
     MORE.emit(R);
   } else {
     // Copy old operand
     FirstMI.addGlobalAddress(MO.getGlobal(), 0, RISCVII::MO_PCREL_HI);
     MachineOptimizationRemark R(DEBUG_TYPE, "FixedValue", DL, &MBB);
-    R << "Fixing reference for " << OrigName << "\n";
+    R << "Fixing reference for " << OrigName;
     MORE.emit(R);
   }
   BuildMI(NewMBB, DL, TII->get(RISCV::ADDI), RISCV::X6)
@@ -477,12 +509,19 @@ void RISCVJumpCallStack::runVerifyCallOnMachineFunction(MachineFunction &MF) {
   MachineOptimizationRemarkEmitter MORE(MF, nullptr);
   for (MachineBasicBlock &MBB : MF) {
     for (MachineInstr &MI : MBB) {
+      if (findInstrumentNOP(MI)) {
+        errs() << MF.getName() << "\n";
+        MBB.print(errs());
+        MI.print(errs());
+        report_fatal_error("Did not remove instrumented NOP");
+      }
       switch (MI.getOpcode()) {
       case RISCV::PseudoCALL:
         auto OpName = getOperandName(MI.getOperand(0));
         if (OpName.endswith(ClJumpCallStackPostfix) || OpName.empty()) {
-          MachineOptimizationRemarkMissed R(DEBUG_TYPE, "FailedCallRename",
-                                            MI.getDebugLoc(), MI.getParent());
+          MachineOptimizationRemark R(DEBUG_TYPE, "FailedCallRename",
+                                      MI.getDebugLoc(), MI.getParent());
+          R << "Failed to rename call: " << OpName;
           MORE.emit(R);
         }
       }
