@@ -576,7 +576,8 @@ unsigned llvm::getJCSPseudoCallSizeInBytes(const MachineInstr &MI) {
       Ret = 8;
       break;
     }
-    MC.reportWarning(SMLoc(), "Unable to find destination function: " + OpName);
+    // MC.reportWarning(SMLoc(), "Unable to find destination function: " +
+    // OpName);
     Ret = 16;
     break;
   }
