@@ -10346,7 +10346,8 @@ static bool CC_RISCV(const DataLayout &DL, RISCVABI::ABI ABI, unsigned ValNo,
                      MVT ValVT, MVT LocVT, CCValAssign::LocInfo LocInfo,
                      ISD::ArgFlagsTy ArgFlags, CCState &State, bool IsFixed,
                      bool IsRet, Type *OrigTy, const RISCVTargetLowering &TLI,
-                     Optional<unsigned> FirstMaskArgument) {
+                     Optional<unsigned> FirstMaskArgument,
+                     __attribute__((unused)) bool ReserveT2) {
   unsigned XLen = DL.getLargestLegalIntTypeSizeInBits();
   assert(XLen == 32 || XLen == 64);
   MVT XLenVT = XLen == 32 ? MVT::i32 : MVT::i64;
@@ -10592,7 +10593,7 @@ void RISCVTargetLowering::analyzeInputArgs(
     RISCVABI::ABI ABI = MF.getSubtarget<RISCVSubtarget>().getTargetABI();
     if (Fn(MF.getDataLayout(), ABI, i, ArgVT, ArgVT, CCValAssign::Full,
            ArgFlags, CCInfo, /*IsFixed=*/true, IsRet, ArgTy, *this,
-           FirstMaskArgument)) {
+           FirstMaskArgument, getJCSFunctionUsesT2(MF))) {
       LLVM_DEBUG(dbgs() << "InputArg #" << i << " has unhandled type "
                         << EVT(ArgVT).getEVTString() << '\n');
       llvm_unreachable(nullptr);
@@ -10618,7 +10619,7 @@ void RISCVTargetLowering::analyzeOutputArgs(
     RISCVABI::ABI ABI = MF.getSubtarget<RISCVSubtarget>().getTargetABI();
     if (Fn(MF.getDataLayout(), ABI, i, ArgVT, ArgVT, CCValAssign::Full,
            ArgFlags, CCInfo, Outs[i].IsFixed, IsRet, OrigTy, *this,
-           FirstMaskArgument)) {
+           FirstMaskArgument, getJCSFunctionUsesT2(MF))) {
       LLVM_DEBUG(dbgs() << "OutputArg #" << i << " has unhandled type "
                         << EVT(ArgVT).getEVTString() << "\n");
       llvm_unreachable(nullptr);
@@ -10776,13 +10777,24 @@ static bool CC_RISCV_FastCC(const DataLayout &DL, RISCVABI::ABI ABI,
                             ISD::ArgFlagsTy ArgFlags, CCState &State,
                             bool IsFixed, bool IsRet, Type *OrigTy,
                             const RISCVTargetLowering &TLI,
-                            Optional<unsigned> FirstMaskArgument) {
+                            Optional<unsigned> FirstMaskArgument,
+                            bool ReserveT2) {
 
   // X5 and X6 might be used for save-restore libcall.
-  static const MCPhysReg GPRList[] = {
+  static const MCPhysReg GPRListWithT2[] = {
       RISCV::X10, RISCV::X11, RISCV::X12, RISCV::X13, RISCV::X14,
       RISCV::X15, RISCV::X16, RISCV::X17, RISCV::X7,  RISCV::X28,
       RISCV::X29, RISCV::X30, RISCV::X31};
+
+  static const MCPhysReg GPRListWithoutT2[] = {
+      RISCV::X10, RISCV::X11, RISCV::X12, RISCV::X13, RISCV::X14,
+      RISCV::X15, RISCV::X16, RISCV::X17, RISCV::X28,
+      RISCV::X29, RISCV::X30, RISCV::X31};
+
+  ArrayRef<MCPhysReg> ARGPRWith = GPRListWithT2;
+  ArrayRef<MCPhysReg> ARGPRWithout = GPRListWithoutT2;
+
+  ArrayRef<MCPhysReg> GPRList = (ReserveT2)?ARGPRWithout:ARGPRWith;
 
   if (LocVT == MVT::i32 || LocVT == MVT::i64) {
     if (unsigned Reg = State.AllocateReg(GPRList)) {
@@ -11468,7 +11480,7 @@ bool RISCVTargetLowering::CanLowerReturn(
     RISCVABI::ABI ABI = MF.getSubtarget<RISCVSubtarget>().getTargetABI();
     if (CC_RISCV(MF.getDataLayout(), ABI, i, VT, VT, CCValAssign::Full,
                  ArgFlags, CCInfo, /*IsFixed=*/true, /*IsRet=*/true, nullptr,
-                 *this, FirstMaskArgument))
+                 *this, FirstMaskArgument, getJCSFunctionUsesT2(MF)))
       return false;
   }
   return true;

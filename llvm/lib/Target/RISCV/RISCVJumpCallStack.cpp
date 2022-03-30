@@ -91,6 +91,25 @@ static cl::opt<bool> ClJumpCallStackAlwaysFixCallers(
 
 namespace {
 
+enum CallStackMethod {
+  JCS_None,
+  JCS_Jump,
+  JCS_Inline,
+};
+
+static CallStackMethod getFunctionCSM(const Function &F) {
+  if (F.hasFnAttribute("jump-call-stack")) {
+    auto A = F.getFnAttribute("jump-call-stack");
+    if (A.getValueAsString().equals("inline"))
+      return JCS_Inline;
+    if (A.getValueAsString().equals("jump"))
+      return JCS_Jump;
+    errs() << A.getValueAsString() << "\n";
+    report_fatal_error("Unable to handle jump-call-stack type");
+  }
+  return JCS_None;
+}
+
 struct RISCVJumpCallStack : public ModulePass {
   static char ID;
   bool runOnModule(Module &M) override;
@@ -107,31 +126,12 @@ struct RISCVJumpCallStack : public ModulePass {
   }
 
 private:
-  enum CallStackMethod {
-    JCS_None,
-    JCS_Jump,
-    JCS_Inline,
-  };
-
-  CallStackMethod getFunctionCSM(Function &F) {
-    if (F.hasFnAttribute("jump-call-stack")) {
-      auto A = F.getFnAttribute("jump-call-stack");
-      if (A.getValueAsString().equals("inline"))
-        return JCS_Inline;
-      if (A.getValueAsString().equals("jump"))
-        return JCS_Jump;
-      errs() << A.getValueAsString() << "\n";
-      report_fatal_error("Unable to handle jump-call-stack type");
-    }
-    return JCS_None;
-  }
-
   bool runExpandPEOnMachineFunction(MachineFunction &Fn, CallStackMethod CSM);
   bool runFixCallOnMachineFunction(MachineFunction &Fn);
   void runVerifyCallOnMachineFunction(MachineFunction &Fn);
   bool expandCall(MachineBasicBlock &MBB, MachineBasicBlock::iterator MBBI,
                   MachineBasicBlock::iterator &NextMBBI,
-                  MachineOptimizationRemarkEmitter &MORE);
+                  MachineOptimizationRemarkEmitter &MORE, bool TailCall);
   bool expandMI(MachineBasicBlock &MBB, MachineBasicBlock::iterator MBBI,
                 MachineBasicBlock::iterator &NextMBBI,
                 MachineOptimizationRemarkEmitter &MORE);
@@ -403,8 +403,10 @@ bool RISCVJumpCallStack::expandMI(MachineBasicBlock &MBB,
                                   MachineOptimizationRemarkEmitter &MORE) {
   switch (MBBI->getOpcode()) {
   case RISCV::PseudoCALL:
-    return expandCall(MBB, MBBI, NextMBBI, MORE);
+    return expandCall(MBB, MBBI, NextMBBI, MORE, false);
     // TODO:  PseudoCALLReg?
+  case RISCV::PseudoTAIL:
+    return expandCall(MBB, MBBI, NextMBBI, MORE, true);
   }
   return false;
 }
@@ -412,7 +414,8 @@ bool RISCVJumpCallStack::expandMI(MachineBasicBlock &MBB,
 bool RISCVJumpCallStack::expandCall(MachineBasicBlock &MBB,
                                     MachineBasicBlock::iterator MBBI,
                                     MachineBasicBlock::iterator &NextMBBI,
-                                    MachineOptimizationRemarkEmitter &MORE) {
+                                    MachineOptimizationRemarkEmitter &MORE,
+                                    bool TailCall) {
   static const unsigned OperandNo = 0;
   MachineFunction *MF = MBB.getParent();
   auto *TII =
@@ -491,8 +494,11 @@ bool RISCVJumpCallStack::expandCall(MachineBasicBlock &MBB,
   BuildMI(NewMBB, DL, TII->get(RISCV::ADDI), RISCV::X6)
       .addReg(RISCV::X6)
       .addMBB(NewMBB, RISCVII::MO_PCREL_LO);
-  BuildMI(NewMBB, DL, TII->get(RISCV::PseudoCALLReg), RISCV::X1 /* ra */)
-      .addReg(RISCV::X6, RegState::ImplicitKill)
+  ((TailCall)
+       ? BuildMI(NewMBB, DL, TII->get(RISCV::PseudoJump))
+             .addReg(RISCV::X7 /* t2 */, RegState::Define | RegState::Dead)
+       : BuildMI(NewMBB, DL, TII->get(RISCV::PseudoCALLReg), RISCV::X1 /* ra */)
+             .addReg(RISCV::X6, RegState::ImplicitKill))
       .addExternalSymbol(ClJumpCallStackJumpoline.c_str(), RISCVII::MO_CALL);
 
   // Move all the rest of the instructions to NewMBB.
@@ -512,6 +518,16 @@ bool RISCVJumpCallStack::expandCall(MachineBasicBlock &MBB,
   return true;
 }
 
+static inline void checkOpName(StringRef OpName, MachineInstr &MI,
+                               MachineOptimizationRemarkEmitter &MORE) {
+  if (OpName.endswith(ClJumpCallStackPostfix) || OpName.empty()) {
+    MachineOptimizationRemark R(DEBUG_TYPE, "FailedCallRename",
+                                MI.getDebugLoc(), MI.getParent());
+    R << "Failed to rename call: " << OpName;
+    MORE.emit(R);
+  }
+}
+
 void RISCVJumpCallStack::runVerifyCallOnMachineFunction(MachineFunction &MF) {
   MachineOptimizationRemarkEmitter MORE(MF, nullptr);
   for (MachineBasicBlock &MBB : MF) {
@@ -524,13 +540,11 @@ void RISCVJumpCallStack::runVerifyCallOnMachineFunction(MachineFunction &MF) {
       }
       switch (MI.getOpcode()) {
       case RISCV::PseudoCALL:
-        auto OpName = getOperandName(MI.getOperand(0));
-        if (OpName.endswith(ClJumpCallStackPostfix) || OpName.empty()) {
-          MachineOptimizationRemark R(DEBUG_TYPE, "FailedCallRename",
-                                      MI.getDebugLoc(), MI.getParent());
-          R << "Failed to rename call: " << OpName;
-          MORE.emit(R);
-        }
+      case RISCV::PseudoTAIL:
+        checkOpName(getOperandName(MI.getOperand(0)), MI, MORE);
+        break;
+      case RISCV::PseudoJump:
+        checkOpName(getOperandName(MI.getOperand(1)), MI, MORE);
       }
     }
   }
@@ -547,7 +561,8 @@ unsigned llvm::getJCSPseudoCallSizeInBytes(const MachineInstr &MI) {
   default:
     report_fatal_error("Unsupported Opcode for getJCSPseudoCallSizeInBytes");
   // TODO: PseudoCALLReg?
-  case RISCV::PseudoCALL: {
+  case RISCV::PseudoCALL:
+  case RISCV::PseudoTAIL: {
     const auto &MO = MI.getOperand(0);
     if (const auto *DestFcn = dyn_cast_or_null<Function>(getGlobalValue(MO))) {
       if (DestFcn->hasFnAttribute("jump-call-stack")) {
@@ -583,4 +598,9 @@ unsigned llvm::getJCSPseudoCallSizeInBytes(const MachineInstr &MI) {
   }
   }
   return Ret;
+}
+
+bool llvm::getJCSFunctionUsesT2(const MachineFunction &MF) {
+  auto const CSM = getFunctionCSM(MF.getFunction());
+  return  CSM == JCS_Jump || CSM == JCS_Inline;
 }

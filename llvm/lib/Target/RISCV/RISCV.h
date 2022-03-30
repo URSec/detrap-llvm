@@ -68,6 +68,7 @@ void initializeRISCVRedundantCopyEliminationPass(PassRegistry &);
 ModulePass *createRISCVJumpCallStackPass();
 void initializeRISCVJumpCallStackPass(PassRegistry &);
 unsigned getJCSPseudoCallSizeInBytes(const MachineInstr &MI);
+bool getJCSFunctionUsesT2(const MachineFunction &MF);
 
 InstructionSelector *createRISCVInstructionSelector(const RISCVTargetMachine &,
                                                     RISCVSubtarget &,

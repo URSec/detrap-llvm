@@ -610,7 +610,8 @@ private:
                                ISD::ArgFlagsTy ArgFlags, CCState &State,
                                bool IsFixed, bool IsRet, Type *OrigTy,
                                const RISCVTargetLowering &TLI,
-                               Optional<unsigned> FirstMaskArgument);
+                               Optional<unsigned> FirstMaskArgument,
+                               bool ReserveT2);
 
   void analyzeInputArgs(MachineFunction &MF, CCState &CCInfo,
                         const SmallVectorImpl<ISD::InputArg> &Ins, bool IsRet,
