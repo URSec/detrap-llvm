@@ -89,6 +89,19 @@ static cl::opt<bool> ClJumpCallStackAlwaysFixCallers(
              "the Jumpoline."),
     cl::Hidden, cl::init(false));
 
+static cl::opt<bool> ClJumpCallStackOverflowCheck(
+    "jump-call-stack-add-overflow-check",
+    cl::desc(
+        "Add a stack overflow check in the form of sw zero, -(XLEN/8)(sp) to "
+        "ensure that the TCB cannot overflow the stack."),
+    cl::Hidden, cl::init(true));
+
+static cl::opt<bool> ClJumpCallStackForce8byteSPOffset(
+    "jump-call-stack-force-64b-sp-offset",
+    cl::desc("Force the use assumption of XLEN=64 for "
+             "jump-call-stack-add-overflow-check"),
+    cl::Hidden, cl::init(false));
+
 namespace {
 
 enum CallStackMethod {
@@ -255,6 +268,15 @@ void RISCVJumpCallStack::insertJCSJump(MachineBasicBlock::iterator &MBBI) {
     MachineOptimizationRemark R(DEBUG_TYPE, "JumpCallStackAdded", DL, &MBB);
     R << "Added jumpoline jump and label to " << MF.getName();
     MORE.emit(R);
+    const auto &STI = MF.getSubtarget<RISCVSubtarget>();
+    bool IsRV64 = STI.hasFeature(RISCV::Feature64Bit);
+    int64_t SlotSize =
+        ClJumpCallStackForce8byteSPOffset ? 8 : STI.getXLen() / 8;
+    BuildMI(MBB, MBBI, DL, TII->get(IsRV64 ? RISCV::SD : RISCV::SW))
+        .addReg(RISCV::X0)
+        .addReg(RISCV::X2 /* sp */)
+        .addImm(-SlotSize)
+        .setMIFlag(MachineInstr::FrameSetup);
     BuildMI(MBB, MBBI, DL, TII->get(RISCV::PseudoCALLReg))
         .addReg(RISCV::X5)
         .addExternalSymbol(ClJumpCallStackJumpolinePop.c_str(),
@@ -339,6 +361,20 @@ void RISCVJumpCallStack::insertJCSEpilogue(MachineBasicBlock::iterator &MBBI) {
 // Fixup prologue and epilogue according to CallStackMethod
 bool RISCVJumpCallStack::runExpandPEOnMachineFunction(MachineFunction &MF,
                                                       CallStackMethod CSM) {
+  auto *RI = MF.getSubtarget().getRegisterInfo();
+  if (RI->hasStackRealignment(MF) || MF.getFrameInfo().hasVarSizedObjects()) {
+    errs() << "Function '" << MF.getName() << "' has";
+    if (RI->hasStackRealignment(MF))
+      errs() << " Stack Realignment";
+    if (RI->hasStackRealignment(MF) && MF.getFrameInfo().hasVarSizedObjects())
+      errs() << " and";
+    if (MF.getFrameInfo().hasVarSizedObjects())
+      errs() << " Variable-sized Objects";
+    errs() << "\n";
+    MF.print(errs());
+    report_fatal_error("RISCVJumpCallStack: Functions that modify the stack "
+                       "pointer are unsupported");
+  }
   bool Modified = false;
   auto MFI = MF.begin();
   for (; (MFI != MF.end()); MFI++) {
@@ -411,6 +447,13 @@ bool RISCVJumpCallStack::expandMI(MachineBasicBlock &MBB,
   return false;
 }
 
+static void reportCallToBadFromJCS(MachineFunction &MF, StringRef Dest,
+                                   StringRef DestProblem) {
+  errs() << "JumpCallStack: Call from jump-call-stack function '"
+         << MF.getName() << "' to " << DestProblem << " destination '" << Dest
+         << "' may corrupt control-flow.\n";
+}
+
 bool RISCVJumpCallStack::expandCall(MachineBasicBlock &MBB,
                                     MachineBasicBlock::iterator MBBI,
                                     MachineBasicBlock::iterator &NextMBBI,
@@ -418,8 +461,8 @@ bool RISCVJumpCallStack::expandCall(MachineBasicBlock &MBB,
                                     bool TailCall) {
   static const unsigned OperandNo = 0;
   MachineFunction *MF = MBB.getParent();
-  auto *TII =
-      static_cast<const RISCVInstrInfo *>(MF->getSubtarget().getInstrInfo());
+  const auto &STI = MF->getSubtarget<RISCVSubtarget>();
+  auto *TII = static_cast<const RISCVInstrInfo *>(STI.getInstrInfo());
   MachineInstr &MI = *MBBI;
   MachineOperand &MO = MI.getOperand(OperandNo);
   DebugLoc DL = MI.getDebugLoc();
@@ -432,6 +475,7 @@ bool RISCVJumpCallStack::expandCall(MachineBasicBlock &MBB,
     OS << MO << "(" << (int)MO.getType();
     R << "Not fixing [empty] " << SS << ")";
     MORE.emit(R);
+    reportCallToBadFromJCS(*MF, "[empty]", "unknown");
     return false;
   }
   MCSymbol *DestSym = NULL;
@@ -440,9 +484,37 @@ bool RISCVJumpCallStack::expandCall(MachineBasicBlock &MBB,
     NewName = getNewDestinationName(OrigName).str();
     DestSym = MC.lookupSymbol(NewName);
     if (!DestSym) {
+      if (auto *Module = MF->getFunction().getParent()) {
+        auto *DestFunction = Module->getFunction(OrigName);
+        if (!DestFunction) {
+          while (auto *DestAlias = Module->getNamedAlias(OrigName)) {
+            auto NewAliasName = DestAlias->getAliasee()->getName();
+            MachineOptimizationRemark R(DEBUG_TYPE, "FollowingAlias", DL, &MBB);
+            R << "Following alias from " << OrigName << " to " << NewAliasName;
+            MORE.emit(R);
+            OrigName = NewAliasName;
+          }
+          DestFunction = Module->getFunction(OrigName);
+          NewName = getNewDestinationName(OrigName).str();
+          DestSym = MC.lookupSymbol(NewName);
+        }
+        if (DestFunction) {
+          if (getFunctionCSM(*DestFunction) == JCS_Jump) {
+            MachineOptimizationRemark R(DEBUG_TYPE, "NotFixedDestLeaf", DL,
+                                        &MBB);
+            R << "Not fixing [no DestSym=" << NewName << ", likely leaf] from "
+              << OrigName;
+            MORE.emit(R);
+            return false;
+          }
+        }
+      }
+    }
+    if (!DestSym) {
       MachineOptimizationRemark R(DEBUG_TYPE, "NotFixedNoDest", DL, &MBB);
       R << "Not fixing [no DestSym=" << NewName << "] from " << OrigName;
       MORE.emit(R);
+      reportCallToBadFromJCS(*MF, OrigName, "non-JCS");
       // no rewrite symbol; just continue
       return false;
     }
@@ -451,6 +523,7 @@ bool RISCVJumpCallStack::expandCall(MachineBasicBlock &MBB,
         MachineOptimizationRemark R(DEBUG_TYPE, "NotFixedDestWeak", DL, &MBB);
         R << "Ignoring rename for weak binding of " << NewName;
         MORE.emit(R);
+        reportCallToBadFromJCS(*MF, OrigName, "weak");
         return false;
       }
     }
@@ -473,6 +546,9 @@ bool RISCVJumpCallStack::expandCall(MachineBasicBlock &MBB,
 
   MF->insert(++MBB.getIterator(), NewMBB);
 
+  bool IsRV64 = STI.hasFeature(RISCV::Feature64Bit);
+  int64_t SlotSize = ClJumpCallStackForce8byteSPOffset ? 8 : STI.getXLen() / 8;
+
   auto FirstMI = BuildMI(NewMBB, DL, TII->get(RISCV::AUIPC), RISCV::X6);
 
   if (DestSym) {
@@ -494,6 +570,10 @@ bool RISCVJumpCallStack::expandCall(MachineBasicBlock &MBB,
   BuildMI(NewMBB, DL, TII->get(RISCV::ADDI), RISCV::X6)
       .addReg(RISCV::X6)
       .addMBB(NewMBB, RISCVII::MO_PCREL_LO);
+  BuildMI(NewMBB, DL, TII->get(IsRV64 ? RISCV::SD : RISCV::SW))
+      .addReg(RISCV::X0)
+      .addReg(RISCV::X2 /* sp */)
+      .addImm(-SlotSize);
   ((TailCall)
        ? BuildMI(NewMBB, DL, TII->get(RISCV::PseudoJump))
              .addReg(RISCV::X7 /* t2 */, RegState::Define | RegState::Dead)
@@ -569,7 +649,7 @@ unsigned llvm::getJCSPseudoCallSizeInBytes(const MachineInstr &MI) {
         if (DestFcn->getFnAttribute("jump-call-stack")
                 .getValueAsString()
                 .equals("jump")) {
-          Ret = 16;
+          Ret = (ClJumpCallStackOverflowCheck) ? 20 : 16;
         }
       }
       // No JCS -- leave at default
@@ -580,7 +660,7 @@ unsigned llvm::getJCSPseudoCallSizeInBytes(const MachineInstr &MI) {
       break;
     auto &MC = MI.getMF()->getContext();
     if (MC.lookupSymbol(getNewDestinationName(OpName))) {
-      Ret = 16;
+      Ret = (ClJumpCallStackOverflowCheck) ? 20 : 16;
       break;
     }
     if (MC.lookupSymbol(OpName)) {
@@ -602,5 +682,5 @@ unsigned llvm::getJCSPseudoCallSizeInBytes(const MachineInstr &MI) {
 
 bool llvm::getJCSFunctionUsesT2(const MachineFunction &MF) {
   auto const CSM = getFunctionCSM(MF.getFunction());
-  return  CSM == JCS_Jump || CSM == JCS_Inline;
+  return CSM == JCS_Jump || CSM == JCS_Inline;
 }
