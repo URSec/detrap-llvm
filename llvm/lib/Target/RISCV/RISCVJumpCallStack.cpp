@@ -46,6 +46,7 @@
 #include "llvm/MC/MCSymbolELF.h"
 #include "llvm/Support/Casting.h"
 #include "llvm/Support/ErrorHandling.h"
+#include "llvm/Support/SMLoc.h"
 #include "llvm/Support/TargetRegistry.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Target/TargetOptions.h"
@@ -100,6 +101,14 @@ static cl::opt<bool> ClJumpCallStackForce8byteSPOffset(
     "jump-call-stack-force-64b-sp-offset",
     cl::desc("Force the use assumption of XLEN=64 for "
              "jump-call-stack-add-overflow-check"),
+    cl::Hidden, cl::init(true));
+// Default tcb.ld has this assumption because ldscript doesn't know any better
+
+static cl::opt<bool> ClJumpCallStackAlwaysScan(
+    "jump-call-stack-always-scan",
+    cl::desc("Always perform code scanning for calls to "
+             "<jump-call-stack-jumpoline> and <jump-call-stack-jumpoline-pop> "
+             "even if no functions use the jumpoline"),
     cl::Hidden, cl::init(false));
 
 namespace {
@@ -140,16 +149,16 @@ struct RISCVJumpCallStack : public ModulePass {
 
 private:
   bool runExpandPEOnMachineFunction(MachineFunction &Fn, CallStackMethod CSM);
-  bool runFixCallOnMachineFunction(MachineFunction &Fn);
+  bool runFixCallOnMachineFunction(MachineFunction &Fn, bool DoFixCallers);
   void runVerifyCallOnMachineFunction(MachineFunction &Fn);
   bool expandCall(MachineBasicBlock &MBB, MachineBasicBlock::iterator MBBI,
                   MachineBasicBlock::iterator &NextMBBI,
                   MachineOptimizationRemarkEmitter &MORE, bool TailCall);
   bool expandMI(MachineBasicBlock &MBB, MachineBasicBlock::iterator MBBI,
                 MachineBasicBlock::iterator &NextMBBI,
-                MachineOptimizationRemarkEmitter &MORE);
-  bool expandMBB(MachineBasicBlock &MBB,
-                 MachineOptimizationRemarkEmitter &MORE);
+                MachineOptimizationRemarkEmitter &MORE, bool DoFixCallers);
+  bool expandMBB(MachineBasicBlock &MBB, MachineOptimizationRemarkEmitter &MORE,
+                 bool DoFixCallers);
 
   void insertJCSInline(MachineBasicBlock::iterator &MBBI);
   void insertJCSJump(MachineBasicBlock::iterator &MBBI);
@@ -167,6 +176,8 @@ static const GlobalValue *getGlobalValue(const MachineOperand &MO) {
 
 static StringRef getOperandName(const MachineOperand &MO,
                                 bool AllowNonzeroOffset = false) {
+  if (!(MO.isGlobal() || MO.isSymbol()))
+    return StringRef();
   if (AllowNonzeroOffset || MO.getOffset() == 0) {
     if (const GlobalValue *GV = getGlobalValue(MO))
       return GV->getName();
@@ -202,12 +213,15 @@ bool RISCVJumpCallStack::runOnModule(Module &M) {
     Changed |= NewChanged;
   }
 
-  if (DefinitelyHasPostjump || ClJumpCallStackAlwaysFixCallers) {
+  bool DoFixCallers = DefinitelyHasPostjump || ClJumpCallStackAlwaysFixCallers;
+
+  if (DoFixCallers || ClJumpCallStackAlwaysScan) {
     for (Function &F : M.functions()) {
       MachineFunction *MaybeMF = MMI.getMachineFunction(F);
       if (!MaybeMF)
         continue;
-      bool NewChanged = this->runFixCallOnMachineFunction(*MaybeMF);
+      bool NewChanged =
+          this->runFixCallOnMachineFunction(*MaybeMF, DoFixCallers);
       Changed |= NewChanged;
     }
   }
@@ -372,8 +386,11 @@ bool RISCVJumpCallStack::runExpandPEOnMachineFunction(MachineFunction &MF,
       errs() << " Variable-sized Objects";
     errs() << "\n";
     MF.print(errs());
-    report_fatal_error("RISCVJumpCallStack: Functions that modify the stack "
-                       "pointer are unsupported");
+    MF.getContext().reportError(
+        SMLoc(), MF.getName() + " uses JumpCallStack/InlineCallStack, but "
+                                "modifies the stack pointer");
+    // report_fatal_error("RISCVJumpCallStack: Functions that modify the stack "
+    //  "pointer are unsupported");
   }
   bool Modified = false;
   auto MFI = MF.begin();
@@ -410,39 +427,101 @@ bool RISCVJumpCallStack::runExpandPEOnMachineFunction(MachineFunction &MF,
   return Modified;
 }
 
-bool RISCVJumpCallStack::runFixCallOnMachineFunction(MachineFunction &MF) {
+bool RISCVJumpCallStack::runFixCallOnMachineFunction(MachineFunction &MF,
+                                                     bool DoFixCallers) {
   bool Modified = false;
   MachineOptimizationRemarkEmitter MORE(MF, nullptr);
   for (MachineBasicBlock &MBB : MF) {
-    Modified |= expandMBB(MBB, MORE);
+    Modified |= expandMBB(MBB, MORE, DoFixCallers);
   }
   return Modified;
 }
 
 bool RISCVJumpCallStack::expandMBB(MachineBasicBlock &MBB,
-                                   MachineOptimizationRemarkEmitter &MORE) {
+                                   MachineOptimizationRemarkEmitter &MORE,
+                                   bool DoFixCallers) {
   bool Modified = false;
 
   MachineBasicBlock::iterator MBBI = MBB.begin(), E = MBB.end();
   while (MBBI != E) {
     MachineBasicBlock::iterator NMBBI = std::next(MBBI);
-    Modified |= expandMI(MBB, MBBI, NMBBI, MORE);
+    Modified |= expandMI(MBB, MBBI, NMBBI, MORE, DoFixCallers);
     MBBI = NMBBI;
   }
 
   return Modified;
 }
 
+static void checkLoadJumpoline(MachineBasicBlock &MBB,
+                               MachineBasicBlock::iterator MBBI) {
+  static const unsigned OperandNo = 1;
+  MachineFunction *MF = MBB.getParent();
+  MachineInstr &MI = *MBBI;
+  MachineOperand &MO = MI.getOperand(OperandNo);
+  StringRef OrigName = getOperandName(MO);
+  if (OrigName.equals(ClJumpCallStackJumpoline) ||
+      OrigName.equals(ClJumpCallStackJumpolinePop)) {
+    MF->getContext().reportError(SMLoc(), "trampoline address loaded in " +
+                                              MF->getName());
+  }
+}
+
+static void checkInlineASM(MachineBasicBlock &MBB,
+                           MachineBasicBlock::iterator MBBI) {
+  MachineFunction *MF = MBB.getParent();
+  MachineInstr &MI = *MBBI;
+  for (unsigned OperandNo = 1; OperandNo < MBBI->getNumOperands();
+       OperandNo++) {
+    MachineOperand &MO = MI.getOperand(OperandNo);
+    StringRef OrigName = getOperandName(MO);
+    if (OrigName.equals(ClJumpCallStackJumpoline) ||
+        OrigName.equals(ClJumpCallStackJumpolinePop)) {
+      MF->getContext().reportError(SMLoc(), "trampoline address used in " +
+                                                MF->getName());
+      // report_fatal_error("Somehow returned from emitError");
+    }
+  }
+}
+
+static void checkJumpTail(MachineBasicBlock &MBB,
+                          MachineBasicBlock::iterator MBBI) {
+  static const unsigned OperandNo = 0;
+  MachineFunction *MF = MBB.getParent();
+  MachineInstr &MI = *MBBI;
+  MachineOperand &MO = MI.getOperand(OperandNo);
+  StringRef OrigName = getOperandName(MO);
+  if (OrigName.equals(ClJumpCallStackJumpoline) ||
+      OrigName.equals(ClJumpCallStackJumpolinePop)) {
+    MF->getContext().reportError(SMLoc(),
+                                 "jump to a trampoline in " + MF->getName());
+  }
+}
+
 bool RISCVJumpCallStack::expandMI(MachineBasicBlock &MBB,
                                   MachineBasicBlock::iterator MBBI,
                                   MachineBasicBlock::iterator &NextMBBI,
-                                  MachineOptimizationRemarkEmitter &MORE) {
+                                  MachineOptimizationRemarkEmitter &MORE,
+                                  bool DoFixCallers) {
   switch (MBBI->getOpcode()) {
   case RISCV::PseudoCALL:
-    return expandCall(MBB, MBBI, NextMBBI, MORE, false);
+    if (DoFixCallers)
+      return expandCall(MBB, MBBI, NextMBBI, MORE, false);
+    checkJumpTail(MBB, MBBI);
+    break;
     // TODO:  PseudoCALLReg?
   case RISCV::PseudoTAIL:
-    return expandCall(MBB, MBBI, NextMBBI, MORE, true);
+    if (DoFixCallers)
+      return expandCall(MBB, MBBI, NextMBBI, MORE, true);
+    checkJumpTail(MBB, MBBI);
+    break;
+  case RISCV::PseudoLA:
+  case RISCV::PseudoLLA:
+    checkLoadJumpoline(MBB, MBBI);
+    break;
+  case RISCV::INLINEASM:
+  case RISCV::INLINEASM_BR:
+    checkInlineASM(MBB, MBBI);
+    break;
   }
   return false;
 }
@@ -477,6 +556,14 @@ bool RISCVJumpCallStack::expandCall(MachineBasicBlock &MBB,
     MORE.emit(R);
     reportCallToBadFromJCS(*MF, "[empty]", "unknown");
     return false;
+  }
+  if (OrigName.equals(ClJumpCallStackJumpoline) ||
+      OrigName.equals(ClJumpCallStackJumpolinePop)) {
+    // MF->print(errs());
+    MF->getContext().reportError(SMLoc(),
+                                 "jump to a trampoline in " + MF->getName());
+    // MI.emitError("jumps to a trampoline");
+    // report_fatal_error("Somehow returned from emitError");
   }
   MCSymbol *DestSym = NULL;
   std::string NewName = "";
