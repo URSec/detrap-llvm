@@ -490,6 +490,10 @@ llvm::Function *CodeGenModule::CreateGlobalInitOrCleanUpFunction(
       !isInNoSanitizeList(SanitizerKind::InlineCallStack, Fn, Loc))
     Fn->addFnAttr("jump-call-stack", "inline");
 
+  if (getLangOpts().Sanitize.has(SanitizerKind::JumpShadowCallStack) &&
+      !isInNoSanitizeList(SanitizerKind::JumpShadowCallStack, Fn, Loc))
+    Fn->addFnAttr("jump-call-stack", "jumpCompressed");
+
   return Fn;
 }
 

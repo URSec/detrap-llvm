@@ -1089,7 +1089,8 @@ SanitizerMask ToolChain::getSupportedSanitizers() const {
   if (getTriple().isAArch64(64))
     Res |= SanitizerKind::MemTag;
   if (getTriple().isRISCV())
-    Res |= SanitizerKind::JumpCallStack | SanitizerKind::InlineCallStack;
+    Res |= SanitizerKind::JumpCallStack | SanitizerKind::InlineCallStack |
+      SanitizerKind::JumpShadowCallStack;
   return Res;
 }
 

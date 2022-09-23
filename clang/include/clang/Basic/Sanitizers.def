@@ -139,6 +139,9 @@ SANITIZER("jump-call-stack", JumpCallStack)
 // Inline Call Stack (like Jump Call Stack, but no jumping)
 SANITIZER("inline-call-stack", InlineCallStack)
 
+// Jump Call Stack
+SANITIZER("jump-shadow-call-stack", JumpShadowCallStack)
+
 // -fsanitize=undefined includes all the sanitizers which have low overhead, no
 // ABI or address space layout implications, and only catch undefined behavior.
 SANITIZER_GROUP("undefined", Undefined,

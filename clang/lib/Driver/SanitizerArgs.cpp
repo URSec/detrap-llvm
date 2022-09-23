@@ -53,6 +53,7 @@ static const SanitizerMask SupportsCoverage =
     SanitizerKind::FuzzerNoLink | SanitizerKind::FloatDivideByZero |
     SanitizerKind::SafeStack | SanitizerKind::ShadowCallStack |
     SanitizerKind::JumpCallStack | SanitizerKind::InlineCallStack |
+    SanitizerKind::JumpShadowCallStack |
     SanitizerKind::Thread | SanitizerKind::ObjCCast;
 static const SanitizerMask RecoverableByDefault =
     SanitizerKind::Undefined | SanitizerKind::Integer |
@@ -76,6 +77,7 @@ static const SanitizerMask CFIClasses =
 static const SanitizerMask CompatibleWithMinimalRuntime =
     TrappingSupported | SanitizerKind::Scudo | SanitizerKind::ShadowCallStack |
     SanitizerKind::JumpCallStack | SanitizerKind::InlineCallStack |
+    SanitizerKind::JumpShadowCallStack |
     SanitizerKind::MemtagStack | SanitizerKind::MemtagHeap |
     SanitizerKind::MemtagGlobals;
 
