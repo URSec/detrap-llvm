@@ -70,11 +70,14 @@ static bool findRISCVMultilibs(const Driver &D,
     Multilib Imafc = makeMultilib("/rv32imafc/ilp32f")
                          .flag("+march=rv32imafc")
                          .flag("+mabi=ilp32f");
+    Multilib Imafdc = makeMultilib("/rv32imafdc/ilp32d")
+                         .flag("+march=rv32imafdc")
+                         .flag("+mabi=ilp32d");
 
     // Multilib reuse
     bool UseI = (Arch == "rv32i") || (Arch == "rv32ic");    // ic => i
     bool UseIm = (Arch == "rv32im") || (Arch == "rv32imc"); // imc => im
-    bool UseImafc = (Arch == "rv32imafc") || (Arch == "rv32imafdc") ||
+    bool UseImafc = (Arch == "rv32imafc") ||
                     (Arch == "rv32gc"); // imafdc,gc => imafc
 
     addMultilibFlag(UseI, "march=rv32i", Flags);
@@ -82,10 +85,11 @@ static bool findRISCVMultilibs(const Driver &D,
     addMultilibFlag((Arch == "rv32iac"), "march=rv32iac", Flags);
     addMultilibFlag((Arch == "rv32imac"), "march=rv32imac", Flags);
     addMultilibFlag(UseImafc, "march=rv32imafc", Flags);
+    addMultilibFlag((Arch == "rv32imafdc"), "march=rv32imafdc", Flags);
     addMultilibFlag(Abi == "ilp32", "mabi=ilp32", Flags);
     addMultilibFlag(Abi == "ilp32f", "mabi=ilp32f", Flags);
 
-    Result.Multilibs = MultilibSet().Either(I, Im, Iac, Imac, Imafc);
+    Result.Multilibs = MultilibSet().Either({I, Im, Iac, Imac, Imafc, Imafdc});
     return Result.Multilibs.select(Flags, Result.SelectedMultilib);
   }
   return false;
