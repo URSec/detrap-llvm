@@ -27,8 +27,10 @@
 #include "RISCV.h"
 #include "RISCVInstrInfo.h"
 #include "RISCVMachineFunctionInfo.h"
+#include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallString.h"
 #include "llvm/BinaryFormat/ELF.h"
+#include "llvm/CodeGen/LivePhysRegs.h"
 #include "llvm/CodeGen/MachineBasicBlock.h"
 #include "llvm/CodeGen/MachineFunction.h"
 #include "llvm/CodeGen/MachineFunctionPass.h"
@@ -47,7 +49,6 @@
 #include "llvm/Support/Casting.h"
 #include "llvm/Support/ErrorHandling.h"
 #include "llvm/Support/SMLoc.h"
-#include "llvm/Support/TargetRegistry.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Target/TargetOptions.h"
 
@@ -83,6 +84,13 @@ static cl::opt<std::string> ClJumpCallStackJumpolinePop(
              "it was called"),
     cl::Hidden, cl::init("tcb_jumpoline_pop"));
 
+static cl::opt<std::string> ClJumpCallStackJumpolineTail(
+    "jump-call-stack-jumpoline-tail",
+    cl::desc("When using JumpCallStack: label of the function to call that "
+             "will save the return address and return to the prolog from which "
+             "it was called"),
+    cl::Hidden, cl::init("tcb_jumpoline_tail"));
+
 static cl::opt<bool> ClJumpCallStackAlwaysFixCallers(
     "jump-call-stack-always-fix-callers",
     cl::desc("Always check all callers for a <jump-call-stack-postfix> version "
@@ -95,7 +103,7 @@ static cl::opt<bool> ClJumpCallStackOverflowCheck(
     cl::desc(
         "Add a stack overflow check in the form of sw zero, -(XLEN/8)(sp) to "
         "ensure that the TCB cannot overflow the stack."),
-    cl::Hidden, cl::init(true));
+    cl::Hidden, cl::init(false));
 
 static cl::opt<bool> ClJumpCallStackForce8byteSPOffset(
     "jump-call-stack-force-64b-sp-offset",
@@ -156,15 +164,20 @@ private:
   void runVerifyCallOnMachineFunction(MachineFunction &Fn);
   bool expandCall(MachineBasicBlock &MBB, MachineBasicBlock::iterator MBBI,
                   MachineBasicBlock::iterator &NextMBBI,
-                  MachineOptimizationRemarkEmitter &MORE, bool TailCall);
+                  MachineOptimizationRemarkEmitter &MORE,
+                  DenseMap<int, MachineBasicBlock::iterator> &MBBNextI,
+                  bool TailCall);
   bool expandMI(MachineBasicBlock &MBB, MachineBasicBlock::iterator MBBI,
                 MachineBasicBlock::iterator &NextMBBI,
-                MachineOptimizationRemarkEmitter &MORE, bool DoFixCallers);
+                MachineOptimizationRemarkEmitter &MORE,
+                DenseMap<int, MachineBasicBlock::iterator> &MBBNextI,
+                bool DoFixCallers);
   bool expandMBB(MachineBasicBlock &MBB, MachineOptimizationRemarkEmitter &MORE,
+                 DenseMap<int, MachineBasicBlock::iterator> &MBBNextI,
                  bool DoFixCallers);
 
-  void insertJCSInline(MachineBasicBlock::iterator &MBBI);
-  void insertJCSJump(MachineBasicBlock::iterator &MBBI);
+  void insertJCSPrologueInline(MachineBasicBlock::iterator &MBBI);
+  void insertJCSPrologueJump(MachineBasicBlock::iterator &MBBI);
   void insertJCSEpilogue(MachineBasicBlock::iterator &MBBI);
   void insertJCSEpilogueCompressed(MachineBasicBlock::iterator &MBBI);
 };
@@ -210,7 +223,7 @@ bool RISCVJumpCallStack::runOnModule(Module &M) {
     if (!MaybeMF)
       continue;
     CallStackMethod CSM = getFunctionCSM(F);
-    DefinitelyHasPostjump |= CSM == JCS_Jump;
+    DefinitelyHasPostjump |= (CSM == JCS_Jump || CSM == JCS_JumpCompressed);
     if (CSM == JCS_None)
       continue;
     bool NewChanged = this->runExpandPEOnMachineFunction(*MaybeMF, CSM);
@@ -267,7 +280,8 @@ static MachineBasicBlock::iterator findInstrumentNOP(MachineBasicBlock &MBB,
   return MBB.end();
 }
 
-void RISCVJumpCallStack::insertJCSJump(MachineBasicBlock::iterator &MBBI) {
+void RISCVJumpCallStack::insertJCSPrologueJump(
+    MachineBasicBlock::iterator &MBBI) {
   auto &MBB = *MBBI->getParent();
   auto &MF = *MBB.getParent();
   auto *TII =
@@ -288,13 +302,15 @@ void RISCVJumpCallStack::insertJCSJump(MachineBasicBlock::iterator &MBBI) {
     MORE.emit(R);
     const auto &STI = MF.getSubtarget<RISCVSubtarget>();
     bool IsRV64 = STI.hasFeature(RISCV::Feature64Bit);
-    int64_t SlotSize =
-        ClJumpCallStackForce8byteSPOffset ? 8 : STI.getXLen() / 8;
-    BuildMI(MBB, MBBI, DL, TII->get(IsRV64 ? RISCV::SD : RISCV::SW))
-        .addReg(RISCV::X0)
-        .addReg(RISCV::X2 /* sp */)
-        .addImm(-SlotSize)
-        .setMIFlag(MachineInstr::FrameSetup);
+    if (ClJumpCallStackOverflowCheck) {
+      int64_t SlotSize =
+          ClJumpCallStackForce8byteSPOffset ? 8 : STI.getXLen() / 8;
+      BuildMI(MBB, MBBI, DL, TII->get(IsRV64 ? RISCV::SD : RISCV::SW))
+          .addReg(RISCV::X0)
+          .addReg(RISCV::X2 /* sp */)
+          .addImm(-SlotSize)
+          .setMIFlag(MachineInstr::FrameSetup);
+    }
     BuildMI(MBB, MBBI, DL, TII->get(RISCV::PseudoCALLReg))
         .addReg(RISCV::X5)
         .addExternalSymbol(ClJumpCallStackJumpolinePop.c_str(),
@@ -317,7 +333,8 @@ void RISCVJumpCallStack::insertJCSJump(MachineBasicBlock::iterator &MBBI) {
   }
 }
 
-void RISCVJumpCallStack::insertJCSInline(MachineBasicBlock::iterator &MBBI) {
+void RISCVJumpCallStack::insertJCSPrologueInline(
+    MachineBasicBlock::iterator &MBBI) {
   auto &MBB = *MBBI->getParent();
   auto &MF = *MBB.getParent();
   auto *TII =
@@ -334,16 +351,19 @@ void RISCVJumpCallStack::insertJCSInline(MachineBasicBlock::iterator &MBBI) {
   MORE.emit(R);
   BuildMI(MBB, MBBI, DL, TII->get(RISCV::LUI), TReg)
       .addExternalSymbol(ClJumpInlineCallStackPointerOffset.c_str(),
-                         RISCVII::MO_HI);
+                         RISCVII::MO_HI)
+      .setMIFlag(MachineInstr::FrameSetup);
   BuildMI(MBB, MBBI, DL, TII->get(RISCV::ADD))
       .addReg(TReg)
       .addReg(TReg)
-      .addReg(SPReg);
+      .addReg(SPReg)
+      .setMIFlag(MachineInstr::FrameSetup);
   BuildMI(MBB, MBBI, DL, TII->get(IsRV64 ? RISCV::SD : RISCV::SW))
       .addReg(RAReg)
       .addReg(TReg)
       .addExternalSymbol(ClJumpInlineCallStackPointerOffset.c_str(),
-                         RISCVII::MO_LO);
+                         RISCVII::MO_LO)
+      .setMIFlag(MachineInstr::FrameSetup);
 }
 
 void RISCVJumpCallStack::insertJCSEpilogue(MachineBasicBlock::iterator &MBBI) {
@@ -376,18 +396,30 @@ void RISCVJumpCallStack::insertJCSEpilogue(MachineBasicBlock::iterator &MBBI) {
       .setMIFlag(MachineInstr::FrameDestroy);
 }
 
+static void insertSCSPRestore(MachineBasicBlock::iterator &MBBI) {
+  auto &MBB = *MBBI->getParent();
+  auto &MF = *MBB.getParent();
+  const auto &STI = MF.getSubtarget<RISCVSubtarget>();
+  auto *TII = static_cast<const RISCVInstrInfo *>(STI.getInstrInfo());
+  auto &DL = MBBI->getDebugLoc();
+  Register const SCSPReg = RISCVABI::getSCSPReg();
+  const bool IsRV64 = STI.hasFeature(RISCV::Feature64Bit);
+  BuildMI(MBB, MBBI, DL, TII->get(RISCV::ADDI), SCSPReg)
+      .addReg(SCSPReg)
+      .addImm(IsRV64 ? -8 : -4)
+      .setMIFlag(MachineInstr::FrameDestroy);
+
 void RISCVJumpCallStack::insertJCSEpilogueCompressed(
     MachineBasicBlock::iterator &MBBI) {
   auto &MBB = *MBBI->getParent();
   auto &MF = *MBB.getParent();
-  auto *TII =
-      static_cast<const RISCVInstrInfo *>(MF.getSubtarget().getInstrInfo());
+  const auto &STI = MF.getSubtarget<RISCVSubtarget>();
+  auto *TII = static_cast<const RISCVInstrInfo *>(STI.getInstrInfo());
   MachineOptimizationRemarkEmitter MORE(MF, nullptr);
   auto &DL = MBBI->getDebugLoc();
-  const auto &STI = MF.getSubtarget<RISCVSubtarget>();
-  Register RAReg = STI.getRegisterInfo()->getRARegister();
-  Register SCSPReg = RISCVABI::getSCSPReg();
-  bool IsRV64 = STI.hasFeature(RISCV::Feature64Bit);
+  Register const RAReg = STI.getRegisterInfo()->getRARegister();
+  Register const SCSPReg = RISCVABI::getSCSPReg();
+  bool const IsRV64 = STI.hasFeature(RISCV::Feature64Bit);
   MachineOptimizationRemark R(DEBUG_TYPE, "JumpShadowCallStackRestored", DL,
                               &MBB);
   R << "Added RA restore to " << MF.getName();
@@ -398,16 +430,14 @@ void RISCVJumpCallStack::insertJCSEpilogueCompressed(
       .addImm(IsRV64 ? -8 : -4)
       .setMIFlag(MachineInstr::FrameDestroy);
   /* addi x18, x18, -SZREG(ra) */
-  BuildMI(MBB, MBBI, DL, TII->get(RISCV::ADDI), SCSPReg)
-      .addReg(SCSPReg)
-      .addImm(IsRV64 ? -8 : -4)
-      .setMIFlag(MachineInstr::FrameDestroy);
+  insertSCSPRestore(MBBI);
 }
 
 // Fixup prologue and epilogue according to CallStackMethod
 bool RISCVJumpCallStack::runExpandPEOnMachineFunction(MachineFunction &MF,
                                                       CallStackMethod CSM) {
   auto *RI = MF.getSubtarget().getRegisterInfo();
+  auto &Ctx = MF.getFunction().getContext();
   switch (CSM) {
   default:
     report_fatal_error("RISCVJumpCallStack: Unsupported CallStackMethod");
@@ -430,12 +460,12 @@ bool RISCVJumpCallStack::runExpandPEOnMachineFunction(MachineFunction &MF,
     }
     break;
   case JCS_JumpCompressed:
-    auto &Ctx = MF.getFunction().getContext();
     const auto &STI = MF.getSubtarget<RISCVSubtarget>();
-    Register SCSPReg = RISCVABI::getSCSPReg();
+    Register const SCSPReg = RISCVABI::getSCSPReg();
     if (!STI.isRegisterReservedByUser(SCSPReg)) {
       Ctx.diagnose(DiagnosticInfoUnsupported{
-          MF.getFunction(), "x18 not reserved by user for Shadow Call Stack."});
+          MF.getFunction(), "x18 not reserved by user for Shadow Call Stack.",
+          MF.begin()->begin()->getDebugLoc()});
       return false;
     }
   }
@@ -455,11 +485,16 @@ bool RISCVJumpCallStack::runExpandPEOnMachineFunction(MachineFunction &MF,
           report_fatal_error("RISCVJumpCallStack: Unsupported CallStackMethod");
           break;
         case JCS_Inline:
-          insertJCSInline(MBBI);
+          insertJCSPrologueInline(MBBI);
           break;
         case JCS_Jump:
         case JCS_JumpCompressed:
-          insertJCSJump(MBBI);
+          if (MBBI->getParent() != &MF.front())
+            Ctx.diagnose(DiagnosticInfoUnsupported{
+                MF.getFunction(), "RISCVJumpCallStack: Prologue not first MBB",
+                MBBI->getDebugLoc(), DS_Error});
+          // report_fatal_error("RISCVJumpCallStack: Prologue not first MBB");
+          insertJCSPrologueJump(MBBI);
           break;
         }
       } else if (MBBI->getFlag(MachineInstr::MIFlag::FrameDestroy)) {
@@ -489,21 +524,26 @@ bool RISCVJumpCallStack::runFixCallOnMachineFunction(MachineFunction &MF,
                                                      bool DoFixCallers) {
   bool Modified = false;
   MachineOptimizationRemarkEmitter MORE(MF, nullptr);
+  DenseMap<int, MachineBasicBlock::iterator> MBBNextI;
   for (MachineBasicBlock &MBB : MF) {
-    Modified |= expandMBB(MBB, MORE, DoFixCallers);
+    Modified |= expandMBB(MBB, MORE, MBBNextI, DoFixCallers);
   }
   return Modified;
 }
 
-bool RISCVJumpCallStack::expandMBB(MachineBasicBlock &MBB,
-                                   MachineOptimizationRemarkEmitter &MORE,
-                                   bool DoFixCallers) {
+bool RISCVJumpCallStack::expandMBB(
+    MachineBasicBlock &MBB, MachineOptimizationRemarkEmitter &MORE,
+    DenseMap<int, MachineBasicBlock::iterator> &MBBNextI, bool DoFixCallers) {
   bool Modified = false;
 
   MachineBasicBlock::iterator MBBI = MBB.begin(), E = MBB.end();
+  auto WantedMBBI = MBBNextI.find(MBB.getNumber());
+  if (WantedMBBI != MBBNextI.end())
+    MBBI = WantedMBBI->getSecond();
   while (MBBI != E) {
     MachineBasicBlock::iterator NMBBI = std::next(MBBI);
     Modified |= expandMI(MBB, MBBI, NMBBI, MORE, DoFixCallers);
+    Modified |= expandMI(MBB, MBBI, NMBBI, MORE, MBBNextI, DoFixCallers);
     MBBI = NMBBI;
   }
 
@@ -549,27 +589,28 @@ static void checkJumpTail(MachineBasicBlock &MBB,
   MachineOperand &MO = MI.getOperand(OperandNo);
   StringRef OrigName = getOperandName(MO);
   if (OrigName.equals(ClJumpCallStackJumpoline) ||
+      OrigName.equals(ClJumpCallStackJumpolineTail) || 
       OrigName.equals(ClJumpCallStackJumpolinePop)) {
-    MF->getContext().reportError(SMLoc(),
-                                 "jump to a trampoline in " + MF->getName());
+    MF->getContext().reportError(
+        SMLoc(), "jump to a trampoline in (checkJumpTail)" + MF->getName());
   }
 }
 
-bool RISCVJumpCallStack::expandMI(MachineBasicBlock &MBB,
-                                  MachineBasicBlock::iterator MBBI,
-                                  MachineBasicBlock::iterator &NextMBBI,
-                                  MachineOptimizationRemarkEmitter &MORE,
-                                  bool DoFixCallers) {
+bool RISCVJumpCallStack::expandMI(
+    MachineBasicBlock &MBB, MachineBasicBlock::iterator MBBI,
+    MachineBasicBlock::iterator &NextMBBI,
+    MachineOptimizationRemarkEmitter &MORE,
+    DenseMap<int, MachineBasicBlock::iterator> &MBBNextI, bool DoFixCallers) {
   switch (MBBI->getOpcode()) {
   case RISCV::PseudoCALL:
     if (DoFixCallers)
-      return expandCall(MBB, MBBI, NextMBBI, MORE, false);
+      return expandCall(MBB, MBBI, NextMBBI, MORE, MBBNextI, false);
     checkJumpTail(MBB, MBBI);
     break;
     // TODO:  PseudoCALLReg?
   case RISCV::PseudoTAIL:
     if (DoFixCallers)
-      return expandCall(MBB, MBBI, NextMBBI, MORE, true);
+      return expandCall(MBB, MBBI, NextMBBI, MORE, MBBNextI, true);
     checkJumpTail(MBB, MBBI);
     break;
   case RISCV::PseudoLA:
@@ -584,6 +625,13 @@ bool RISCVJumpCallStack::expandMI(MachineBasicBlock &MBB,
   return false;
 }
 
+static void reportCallToBadFromJCS(MachineFunction &MF, MachineInstr &MI,
+                                   StringRef Dest, StringRef DestProblem) {
+  MF.getFunction().getContext().diagnose(
+      DiagnosticInfoUnsupported{MF.getFunction(),
+                                Twine("Call to ") + DestProblem + " '" + Dest +
+                                    "' may corrupt control-flow",
+                                MI.getDebugLoc(), DS_Warning});
 static void reportCallToBadFromJCS(MachineFunction &MF, StringRef Dest,
                                    StringRef DestProblem) {
   errs() << "JumpCallStack: Call from jump-call-stack function '"
@@ -591,11 +639,11 @@ static void reportCallToBadFromJCS(MachineFunction &MF, StringRef Dest,
          << "' may corrupt control-flow.\n";
 }
 
-bool RISCVJumpCallStack::expandCall(MachineBasicBlock &MBB,
-                                    MachineBasicBlock::iterator MBBI,
-                                    MachineBasicBlock::iterator &NextMBBI,
-                                    MachineOptimizationRemarkEmitter &MORE,
-                                    bool TailCall) {
+bool RISCVJumpCallStack::expandCall(
+    MachineBasicBlock &MBB, MachineBasicBlock::iterator MBBI,
+    MachineBasicBlock::iterator &NextMBBI,
+    MachineOptimizationRemarkEmitter &MORE,
+    DenseMap<int, MachineBasicBlock::iterator> &MBBNextI, bool TailCall) {
   static const unsigned OperandNo = 0;
   MachineFunction *MF = MBB.getParent();
   const auto &STI = MF->getSubtarget<RISCVSubtarget>();
@@ -605,6 +653,12 @@ bool RISCVJumpCallStack::expandCall(MachineBasicBlock &MBB,
   DebugLoc DL = MI.getDebugLoc();
   StringRef OrigName = getOperandName(MO);
   MCContext &MC = MF->getContext();
+  if (MI.getFlag(MachineInstr::FrameSetup)) {
+    MachineOptimizationRemark R(DEBUG_TYPE, "NotFixedFrameSetup", DL, &MBB);
+    R << "Not fixing [frame setup] (" << OrigName << ")";
+    MORE.emit(R);
+    return false;
+  }
   if (OrigName.empty()) {
     MachineOptimizationRemark R(DEBUG_TYPE, "NotFixedEmpty", DL, &MBB);
     SmallString<128> SS;
@@ -612,14 +666,13 @@ bool RISCVJumpCallStack::expandCall(MachineBasicBlock &MBB,
     OS << MO << "(" << (int)MO.getType();
     R << "Not fixing [empty] " << SS << ")";
     MORE.emit(R);
-    reportCallToBadFromJCS(*MF, "[empty]", "unknown");
+    reportCallToBadFromJCS(*MF, MI, "[empty]", "unknown");
     return false;
   }
   if (OrigName.equals(ClJumpCallStackJumpoline) ||
       OrigName.equals(ClJumpCallStackJumpolinePop)) {
-    // MF->print(errs());
-    MF->getContext().reportError(SMLoc(),
-                                 "jump to a trampoline in " + MF->getName());
+    MF->getContext().reportError(
+        SMLoc(), "jump to a trampoline in (expandCall)" + MF->getName());
     // MI.emitError("jumps to a trampoline");
     // report_fatal_error("Somehow returned from emitError");
   }
@@ -659,7 +712,7 @@ bool RISCVJumpCallStack::expandCall(MachineBasicBlock &MBB,
       MachineOptimizationRemark R(DEBUG_TYPE, "NotFixedNoDest", DL, &MBB);
       R << "Not fixing [no DestSym=" << NewName << "] from " << OrigName;
       MORE.emit(R);
-      reportCallToBadFromJCS(*MF, OrigName, "non-JCS");
+      reportCallToBadFromJCS(*MF, MI, OrigName, "non-JCS");
       // no rewrite symbol; just continue
       return false;
     }
@@ -668,7 +721,7 @@ bool RISCVJumpCallStack::expandCall(MachineBasicBlock &MBB,
         MachineOptimizationRemark R(DEBUG_TYPE, "NotFixedDestWeak", DL, &MBB);
         R << "Ignoring rename for weak binding of " << NewName;
         MORE.emit(R);
-        reportCallToBadFromJCS(*MF, OrigName, "weak");
+        reportCallToBadFromJCS(*MF, MI, OrigName, "weak");
         return false;
       }
     }
@@ -694,8 +747,12 @@ bool RISCVJumpCallStack::expandCall(MachineBasicBlock &MBB,
   bool IsRV64 = STI.hasFeature(RISCV::Feature64Bit);
   int64_t SlotSize = ClJumpCallStackForce8byteSPOffset ? 8 : STI.getXLen() / 8;
 
+  Register PostJumpAddrReg =
+      (TailCall) ? RISCV::X5 /* t0 */ : RISCV::X6 /* t1 */;
+  Register TailJumpRegisterTemporary = RISCV::X6 /* t1 */;
+
   /* 1: luipc t1, %pcrel_hi(original_label/value) */
-  auto FirstMI = BuildMI(NewMBB, DL, TII->get(RISCV::AUIPC), RISCV::X6);
+  auto FirstMI = BuildMI(NewMBB, DL, TII->get(RISCV::AUIPC), PostJumpAddrReg);
 
   if (DestSym) {
     // Ensure that DestSym has a null-terminated name
@@ -714,21 +771,29 @@ bool RISCVJumpCallStack::expandCall(MachineBasicBlock &MBB,
     MORE.emit(R);
   }
   /* addi t1, t1, %pcrel_lo(1b) */
-  BuildMI(NewMBB, DL, TII->get(RISCV::ADDI), RISCV::X6)
-      .addReg(RISCV::X6)
+  BuildMI(NewMBB, DL, TII->get(RISCV::ADDI), PostJumpAddrReg)
+      .addReg(PostJumpAddrReg)
       .addMBB(NewMBB, RISCVII::MO_PCREL_LO);
-  /* REG_S zero, -SlotSize(sp) */
-  BuildMI(NewMBB, DL, TII->get(IsRV64 ? RISCV::SD : RISCV::SW))
-      .addReg(RISCV::X0)
-      .addReg(RISCV::X2 /* sp */)
-      .addImm(-SlotSize);
+  if (ClJumpCallStackOverflowCheck) {
+    /* REG_S zero, -SlotSize(sp) */
+    BuildMI(NewMBB, DL, TII->get(IsRV64 ? RISCV::SD : RISCV::SW))
+        .addReg(RISCV::X0)
+        .addReg(RISCV::X2 /* sp */)
+        .addImm(-SlotSize);
+  }
   ((TailCall)
-       /* jump tcb_jumpoline, t2 */
+       /* jump tcb_jumpoline */
        ? BuildMI(NewMBB, DL, TII->get(RISCV::PseudoJump))
-             .addReg(RISCV::X7 /* t2 */, RegState::Define | RegState::Dead)
+             .addReg(TailJumpRegisterTemporary,
+                     RegState::Define | RegState::Dead)
        /* call ra, tcb_jumpoline */
-       : BuildMI(NewMBB, DL, TII->get(RISCV::PseudoCALL))
-      .addExternalSymbol(ClJumpCallStackJumpoline.c_str(), RISCVII::MO_CALL);
+       : BuildMI(NewMBB, DL, TII->get(RISCV::PseudoCALL)))
+      .addExternalSymbol((TailCall) ? ClJumpCallStackJumpolineTail.c_str()
+                                    : ClJumpCallStackJumpoline.c_str(),
+                         RISCVII::MO_CALL);
+
+  // Save point in the new MBB that's already expanded
+  auto NewMBBNextMBBI = std::prev(NewMBB->end());
 
   // Move all the rest of the instructions to NewMBB.
   NewMBB->splice(NewMBB->end(), &MBB, std::next(MBBI), MBB.end());
@@ -743,6 +808,9 @@ bool RISCVJumpCallStack::expandCall(MachineBasicBlock &MBB,
 
   NextMBBI = MBB.end();
   MI.eraseFromParent();
+
+  MBBNextI.insert(
+      std::make_pair(NewMBB->getNumber(), std::next(NewMBBNextMBBI)));
 
   return true;
 }
@@ -786,6 +854,16 @@ ModulePass *llvm::createRISCVJumpCallStackPass() {
 
 unsigned llvm::getJCSPseudoCallSizeInBytes(const MachineInstr &MI) {
   unsigned Ret = 8;
+  bool IsRV64 = false;
+
+  const RISCVInstrInfo *TII = nullptr;
+  if (const auto *MF = MI.getMF()) {
+    const auto &STI = MF->getSubtarget<RISCVSubtarget>();
+    IsRV64 = STI.is64Bit();
+    TII = static_cast<const RISCVInstrInfo *>(STI.getInstrInfo());
+    Ret = TII->get(MI.getOpcode()).getSize();
+  }
+
   switch (MI.getOpcode()) {
   default:
     report_fatal_error("Unsupported Opcode for getJCSPseudoCallSizeInBytes");
@@ -797,10 +875,15 @@ unsigned llvm::getJCSPseudoCallSizeInBytes(const MachineInstr &MI) {
       auto DestFcnCSM = getFunctionCSM(*DestFcn);
       switch (DestFcnCSM) {
       case JCS_Jump:
-        Ret = (ClJumpCallStackOverflowCheck) ? 20 : 16;
-        break;
       case JCS_JumpCompressed:
-        Ret = 16;
+        if (TII)
+          Ret = TII->get(RISCV::PseudoCALL).getSize() +
+                TII->get(RISCV::PseudoLA).getSize() +
+                (ClJumpCallStackOverflowCheck
+                     ? TII->get(IsRV64 ? RISCV::SD : RISCV::SW).getSize()
+                     : 0);
+        else
+          Ret = (ClJumpCallStackOverflowCheck) ? 20 : 16;
         break;
       default:
         break;
@@ -812,7 +895,14 @@ unsigned llvm::getJCSPseudoCallSizeInBytes(const MachineInstr &MI) {
       break;
     auto &MC = MI.getMF()->getContext();
     if (MC.lookupSymbol(getNewDestinationName(OpName))) {
-      Ret = (ClJumpCallStackOverflowCheck) ? 20 : 16;
+      if (TII)
+        Ret = TII->get(RISCV::PseudoCALL).getSize() +
+              TII->get(RISCV::PseudoLA).getSize() +
+              (ClJumpCallStackOverflowCheck
+                   ? TII->get(IsRV64 ? RISCV::SD : RISCV::SW).getSize()
+                   : 0);
+      else
+        Ret = (ClJumpCallStackOverflowCheck) ? 20 : 16;
       break;
     }
     if (MC.lookupSymbol(OpName)) {
@@ -820,7 +910,6 @@ unsigned llvm::getJCSPseudoCallSizeInBytes(const MachineInstr &MI) {
           SMLoc(),
           "Assuming destination function will not get JCS treatment: " +
               OpName);
-      Ret = 8;
       break;
     }
     // MC.reportWarning(SMLoc(), "Unable to find destination function: " +
@@ -835,7 +924,20 @@ unsigned llvm::getJCSPseudoCallSizeInBytes(const MachineInstr &MI) {
 bool llvm::getJCSFunctionUsesT2(const MachineFunction &MF) {
   auto const CSM = getFunctionCSM(MF.getFunction());
   // Note that the compressed variants do not need t2.
-  return CSM == JCS_Jump || CSM == JCS_Inline;
+  switch (CSM) {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wcovered-switch-default"
+  default:
+#pragma clang diagnostic pop
+    report_fatal_error("RISCVJumpCallStack: Unsupported CallStackMethod");
+    break;
+  case JCS_Jump:
+  case JCS_Inline:
+    return true;
+  case JCS_JumpCompressed:
+  case JCS_None:
+    return false;
+  }
 }
 
 bool llvm::canJCSFunctionUseShrinkWrap(const MachineFunction &MF) {
