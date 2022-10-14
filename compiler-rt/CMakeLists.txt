@@ -67,6 +67,8 @@ set(COMPILER_RT_HWASAN_WITH_INTERCEPTORS ${COMPILER_RT_HWASAN_WITH_INTERCEPTORS_
 set(COMPILER_RT_BAREMETAL_BUILD OFF CACHE BOOL
   "Build for a bare-metal target.")
 
+set(COMPILER_RT_LTO_BUILD OFF CACHE BOOL "Build compiler-rt with LTO")
+
 if (COMPILER_RT_STANDALONE_BUILD)
   load_llvm_config()
   if (TARGET intrinsics_gen)
