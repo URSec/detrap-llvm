@@ -213,31 +213,31 @@ INITIALIZE_PASS(RISCVJumpCallStack, DEBUG_TYPE,
                 RISCV_JUMP_CALL_STACK_OPTIMIZE_NAME, false, false)
 
 bool RISCVJumpCallStack::runOnModule(Module &M) {
-  MachineModuleInfo &MMI = getAnalysis<MachineModuleInfoWrapperPass>().getMMI();
+  const MachineModuleInfo &MMI = getAnalysis<MachineModuleInfoWrapperPass>().getMMI();
 
   bool Changed = false;
   bool DefinitelyHasPostjump = false;
 
-  for (Function &F : M.functions()) {
+  for (const Function &F : M.functions()) {
     MachineFunction *MaybeMF = MMI.getMachineFunction(F);
     if (!MaybeMF)
       continue;
-    CallStackMethod CSM = getFunctionCSM(F);
+    const CallStackMethod CSM = getFunctionCSM(F);
     DefinitelyHasPostjump |= (CSM == JCS_Jump || CSM == JCS_JumpCompressed);
     if (CSM == JCS_None)
       continue;
-    bool NewChanged = this->runExpandPEOnMachineFunction(*MaybeMF, CSM);
+    const bool NewChanged = this->runExpandPEOnMachineFunction(*MaybeMF, CSM);
     Changed |= NewChanged;
   }
 
-  bool DoFixCallers = DefinitelyHasPostjump || ClJumpCallStackAlwaysFixCallers;
+  const bool DoFixCallers = DefinitelyHasPostjump || ClJumpCallStackAlwaysFixCallers;
 
   if (DoFixCallers || ClJumpCallStackAlwaysScan) {
-    for (Function &F : M.functions()) {
+    for (const Function &F : M.functions()) {
       MachineFunction *MaybeMF = MMI.getMachineFunction(F);
       if (!MaybeMF)
         continue;
-      bool NewChanged =
+      const bool NewChanged =
           this->runFixCallOnMachineFunction(*MaybeMF, DoFixCallers);
       Changed |= NewChanged;
     }
@@ -301,9 +301,9 @@ void RISCVJumpCallStack::insertJCSPrologueJump(
     R << "Added jumpoline jump and label to " << MF.getName();
     MORE.emit(R);
     const auto &STI = MF.getSubtarget<RISCVSubtarget>();
-    bool IsRV64 = STI.hasFeature(RISCV::Feature64Bit);
+    const bool IsRV64 = STI.hasFeature(RISCV::Feature64Bit);
     if (ClJumpCallStackOverflowCheck) {
-      int64_t SlotSize =
+      const int64_t SlotSize =
           ClJumpCallStackForce8byteSPOffset ? 8 : STI.getXLen() / 8;
       BuildMI(MBB, MBBI, DL, TII->get(IsRV64 ? RISCV::SD : RISCV::SW))
           .addReg(RISCV::X0)
@@ -342,10 +342,10 @@ void RISCVJumpCallStack::insertJCSPrologueInline(
   MachineOptimizationRemarkEmitter MORE(MF, nullptr);
   auto &DL = MBBI->getDebugLoc();
   const auto &STI = MF.getSubtarget<RISCVSubtarget>();
-  Register RAReg = STI.getRegisterInfo()->getRARegister();
-  Register SPReg = RISCV::X2;
-  Register TReg = RISCV::X5; // t0
-  bool IsRV64 = STI.hasFeature(RISCV::Feature64Bit);
+  const Register RAReg = STI.getRegisterInfo()->getRARegister();
+  const Register SPReg = RISCV::X2;
+  const Register TReg = RISCV::X5; // t0
+  const bool IsRV64 = STI.hasFeature(RISCV::Feature64Bit);
   MachineOptimizationRemark R(DEBUG_TYPE, "InlineCallStackSaved", DL, &MBB);
   R << "Inlined RA Save in " << MF.getName();
   MORE.emit(R);
@@ -374,10 +374,10 @@ void RISCVJumpCallStack::insertJCSEpilogue(MachineBasicBlock::iterator &MBBI) {
   MachineOptimizationRemarkEmitter MORE(MF, nullptr);
   auto &DL = MBBI->getDebugLoc();
   const auto &STI = MF.getSubtarget<RISCVSubtarget>();
-  Register RAReg = STI.getRegisterInfo()->getRARegister();
-  Register SPReg = RISCV::X2;
-  Register TReg = RISCV::X5; // t0
-  bool IsRV64 = STI.hasFeature(RISCV::Feature64Bit);
+  const Register RAReg = STI.getRegisterInfo()->getRARegister();
+  const Register SPReg = RISCV::X2;
+  const Register TReg = RISCV::X5; // t0
+  const bool IsRV64 = STI.hasFeature(RISCV::Feature64Bit);
   MachineOptimizationRemark R(DEBUG_TYPE, "JumpCallStackRestored", DL, &MBB);
   R << "Added RA restore to " << MF.getName();
   MORE.emit(R);
@@ -408,6 +408,7 @@ static void insertSCSPRestore(MachineBasicBlock::iterator &MBBI) {
       .addReg(SCSPReg)
       .addImm(IsRV64 ? -8 : -4)
       .setMIFlag(MachineInstr::FrameDestroy);
+}
 
 void RISCVJumpCallStack::insertJCSEpilogueCompressed(
     MachineBasicBlock::iterator &MBBI) {
@@ -555,8 +556,8 @@ static void checkLoadJumpoline(MachineBasicBlock &MBB,
   static const unsigned OperandNo = 1;
   MachineFunction *MF = MBB.getParent();
   MachineInstr &MI = *MBBI;
-  MachineOperand &MO = MI.getOperand(OperandNo);
-  StringRef OrigName = getOperandName(MO);
+  const MachineOperand &MO = MI.getOperand(OperandNo);
+  const StringRef OrigName = getOperandName(MO);
   if (OrigName.equals(ClJumpCallStackJumpoline) ||
       OrigName.equals(ClJumpCallStackJumpolinePop)) {
     MF->getContext().reportError(SMLoc(), "trampoline address loaded in " +
@@ -570,8 +571,8 @@ static void checkInlineASM(MachineBasicBlock &MBB,
   MachineInstr &MI = *MBBI;
   for (unsigned OperandNo = 1; OperandNo < MBBI->getNumOperands();
        OperandNo++) {
-    MachineOperand &MO = MI.getOperand(OperandNo);
-    StringRef OrigName = getOperandName(MO);
+    const MachineOperand &MO = MI.getOperand(OperandNo);
+    const StringRef OrigName = getOperandName(MO);
     if (OrigName.equals(ClJumpCallStackJumpoline) ||
         OrigName.equals(ClJumpCallStackJumpolinePop)) {
       MF->getContext().reportError(SMLoc(), "trampoline address used in " +
@@ -586,8 +587,8 @@ static void checkJumpTail(MachineBasicBlock &MBB,
   static const unsigned OperandNo = 0;
   MachineFunction *MF = MBB.getParent();
   MachineInstr &MI = *MBBI;
-  MachineOperand &MO = MI.getOperand(OperandNo);
-  StringRef OrigName = getOperandName(MO);
+  const MachineOperand &MO = MI.getOperand(OperandNo);
+  const StringRef OrigName = getOperandName(MO);
   if (OrigName.equals(ClJumpCallStackJumpoline) ||
       OrigName.equals(ClJumpCallStackJumpolineTail) || 
       OrigName.equals(ClJumpCallStackJumpolinePop)) {
@@ -649,10 +650,10 @@ bool RISCVJumpCallStack::expandCall(
   const auto &STI = MF->getSubtarget<RISCVSubtarget>();
   auto *TII = static_cast<const RISCVInstrInfo *>(STI.getInstrInfo());
   MachineInstr &MI = *MBBI;
-  MachineOperand &MO = MI.getOperand(OperandNo);
-  DebugLoc DL = MI.getDebugLoc();
+  const MachineOperand &MO = MI.getOperand(OperandNo);
+  const DebugLoc DL = MI.getDebugLoc();
   StringRef OrigName = getOperandName(MO);
-  MCContext &MC = MF->getContext();
+  const MCContext &MC = MF->getContext();
   if (MI.getFlag(MachineInstr::FrameSetup)) {
     MachineOptimizationRemark R(DEBUG_TYPE, "NotFixedFrameSetup", DL, &MBB);
     R << "Not fixing [frame setup] (" << OrigName << ")";
@@ -744,12 +745,12 @@ bool RISCVJumpCallStack::expandCall(
 
   MF->insert(++MBB.getIterator(), NewMBB);
 
-  bool IsRV64 = STI.hasFeature(RISCV::Feature64Bit);
-  int64_t SlotSize = ClJumpCallStackForce8byteSPOffset ? 8 : STI.getXLen() / 8;
+  const bool IsRV64 = STI.hasFeature(RISCV::Feature64Bit);
+  const int64_t SlotSize = ClJumpCallStackForce8byteSPOffset ? 8 : STI.getXLen() / 8;
 
-  Register PostJumpAddrReg =
+  const Register PostJumpAddrReg =
       (TailCall) ? RISCV::X5 /* t0 */ : RISCV::X6 /* t1 */;
-  Register TailJumpRegisterTemporary = RISCV::X6 /* t1 */;
+  const Register TailJumpRegisterTemporary = RISCV::X6 /* t1 */;
 
   /* 1: luipc t1, %pcrel_hi(original_label/value) */
   auto FirstMI = BuildMI(NewMBB, DL, TII->get(RISCV::AUIPC), PostJumpAddrReg);
