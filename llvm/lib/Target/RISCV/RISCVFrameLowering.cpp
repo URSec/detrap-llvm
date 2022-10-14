@@ -1311,7 +1311,7 @@ bool RISCVFrameLowering::enableShrinkWrapping(const MachineFunction &MF) const {
   if (MF.getFunction().hasOptNone())
     return false;
 
-  return true;
+  return canJCSFunctionUseShrinkWrap(MF);
 }
 
 bool RISCVFrameLowering::canUseAsPrologue(const MachineBasicBlock &MBB) const {

@@ -15,6 +15,7 @@
 #define LLVM_LIB_TARGET_RISCV_RISCV_H
 
 #include "MCTargetDesc/RISCVBaseInfo.h"
+#include "llvm/Pass.h"
 #include "llvm/Target/TargetMachine.h"
 
 namespace llvm {
@@ -69,6 +70,7 @@ ModulePass *createRISCVJumpCallStackPass();
 void initializeRISCVJumpCallStackPass(PassRegistry &);
 unsigned getJCSPseudoCallSizeInBytes(const MachineInstr &MI);
 bool getJCSFunctionUsesT2(const MachineFunction &MF);
+bool canJCSFunctionUseShrinkWrap(const MachineFunction &MF);
 
 InstructionSelector *createRISCVInstructionSelector(const RISCVTargetMachine &,
                                                     RISCVSubtarget &,

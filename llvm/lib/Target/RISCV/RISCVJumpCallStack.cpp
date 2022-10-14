@@ -837,3 +837,33 @@ bool llvm::getJCSFunctionUsesT2(const MachineFunction &MF) {
   // Note that the compressed variants do not need t2.
   return CSM == JCS_Jump || CSM == JCS_Inline;
 }
+
+bool llvm::canJCSFunctionUseShrinkWrap(const MachineFunction &MF) {
+  auto const CSM = getFunctionCSM(MF.getFunction());
+  // Note that the inline variants never get $postjump optimized, and can use
+  // shrink wrap without any problems.
+  switch (CSM) {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wcovered-switch-default"
+  default:
+#pragma clang diagnostic pop
+    report_fatal_error("RISCVJumpCallStack: Unsupported CallStackMethod");
+    break;
+  case JCS_Jump:
+  case JCS_JumpCompressed:
+    // If we do not save return address, we can shrinkwrap, but probably don't
+    // know that yet
+    // {
+    //   const auto &STI = MF.getSubtarget<RISCVSubtarget>();
+    //   Register RAReg = STI.getRegisterInfo()->getRARegister();
+    //   auto &CSI = MF.getFrameInfo().getCalleeSavedInfo();
+    //   return std::none_of(CSI.begin(), CSI.end(), [&](CalleeSavedInfo &CSR) {
+    //     return CSR.getReg() == RAReg;
+    //   });
+    // }
+    return false;
+  case JCS_Inline:
+  case JCS_None:
+    return true;
+  }
+}
