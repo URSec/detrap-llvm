@@ -1053,8 +1053,8 @@ unsigned RISCVInstrInfo::getInstSizeInBytes(const MachineInstr &MI) const {
   }
 
   //TODO: also modify PseudoCALLReg with JCS?
-  if (Opcode == TargetOpcode::PseudoCALL ||
-      Opcode == TargetOpcode::PseudoTAIL)
+  if (Opcode == RISCV::PseudoCALL ||
+      Opcode == RISCV::PseudoTAIL)
     // Due to JumpCallStack, these might be doubled
     return getJCSPseudoCallSizeInBytes(MI);
 
