@@ -1090,7 +1090,7 @@ SanitizerMask ToolChain::getSupportedSanitizers() const {
     Res |= SanitizerKind::MemTag;
   if (getTriple().isRISCV())
     Res |= SanitizerKind::JumpCallStack | SanitizerKind::InlineCallStack |
-      SanitizerKind::JumpShadowCallStack;
+      SanitizerKind::JumpShadowCallStack | SanitizerKind::JumpTableCallStack;
   return Res;
 }
 

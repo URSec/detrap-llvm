@@ -775,6 +775,8 @@ void CodeGenFunction::StartFunction(GlobalDecl GD, QualType RetTy,
     Fn->addFnAttr("jump-call-stack", "inline");
   if (SanOpts.has(SanitizerKind::JumpShadowCallStack))
     Fn->addFnAttr("jump-call-stack", "jumpCompressed");
+  if (SanOpts.has(SanitizerKind::JumpTableCallStack))
+    Fn->addFnAttr("jump-call-stack", "jumpTableCompressed");
 
   // Apply fuzzing attribute to the function.
   if (SanOpts.hasOneOf(SanitizerKind::Fuzzer | SanitizerKind::FuzzerNoLink))

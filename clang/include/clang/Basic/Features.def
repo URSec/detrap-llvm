@@ -238,6 +238,8 @@ FEATURE(inline_call_stack,
         LangOpts.Sanitize.has(SanitizerKind::InlineCallStack))
 FEATURE(jump_shadow_call_stack,
         LangOpts.Sanitize.has(SanitizerKind::JumpShadowCallStack))
+FEATURE(jump_table_call_stack,
+        LangOpts.Sanitize.has(SanitizerKind::JumpTableCallStack))
 FEATURE(tls, PP.getTargetInfo().isTLSSupported())
 FEATURE(underlying_type, LangOpts.CPlusPlus)
 FEATURE(experimental_library, LangOpts.ExperimentalLibrary)
