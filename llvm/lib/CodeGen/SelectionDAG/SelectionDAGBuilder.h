@@ -277,7 +277,7 @@ public:
   SDValue getControlRoot();
 
   SDLoc getCurSDLoc() const {
-    return SDLoc(CurInst, SDNodeOrder);
+    return CurInst ? SDLoc(CurInst, SDNodeOrder) : SDLoc();
   }
 
   DebugLoc getCurDebugLoc() const {
@@ -323,10 +323,10 @@ public:
   /// Evict any dangling debug information, attempting to salvage it first.
   void resolveOrClearDbgInfo();
 
-  SDValue getValue(const Value *V);
+  SDValue getValue(const Value *V, MDNode *NoSpill = nullptr);
 
-  SDValue getNonRegisterValue(const Value *V);
-  SDValue getValueImpl(const Value *V);
+  SDValue getNonRegisterValue(const Value *V, MDNode *NoSpill = nullptr);
+  SDValue getValueImpl(const Value *V, MDNode *NoSpill = nullptr);
 
   void setValue(const Value *V, SDValue NewN) {
     SDValue &N = NodeMap[V];

@@ -412,7 +412,7 @@ private:
     // The compiler can reduce this expression to a constant iff we pass an
     // empty DebugLoc.  Thankfully, the debug location doesn't have any bearing
     // on the subclass data.
-    return SDNodeT(IROrder, DebugLoc(), std::forward<ArgTypes>(Args)...)
+    return SDNodeT(IROrder, DebugLoc(), nullptr, std::forward<ArgTypes>(Args)...)
         .getRawSubclassData();
   }
 
@@ -420,7 +420,7 @@ private:
   static uint16_t getSyntheticNodeSubclassData(unsigned Opc, unsigned Order,
                                                 SDVTList VTs, EVT MemoryVT,
                                                 MachineMemOperand *MMO) {
-    return SDNodeTy(Opc, Order, DebugLoc(), VTs, MemoryVT, MMO)
+    return SDNodeTy(Opc, Order, DebugLoc(), nullptr, VTs, MemoryVT, MMO)
          .getRawSubclassData();
   }
 
@@ -718,7 +718,7 @@ public:
     return getFrameIndex(FI, VT, true);
   }
   SDValue getJumpTable(int JTI, EVT VT, bool isTarget = false,
-                       unsigned TargetFlags = 0);
+                       unsigned TargetFlags = 0, MDNode *NoSpill = nullptr);
   SDValue getTargetJumpTable(int JTI, EVT VT, unsigned TargetFlags = 0) {
     return getJumpTable(JTI, VT, true, TargetFlags);
   }

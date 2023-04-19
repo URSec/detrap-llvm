@@ -22,6 +22,7 @@
 #include "llvm/ADT/SetVector.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/Statistic.h"
+#include "llvm/ADT/StringExtras.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/ADT/TinyPtrVector.h"
 #include "llvm/ADT/Triple.h"
@@ -122,6 +123,12 @@ static cl::opt<bool>
     ClDropTypeTests("lowertypetests-drop-type-tests",
                     cl::desc("Simply drop type test assume sequences"),
                     cl::Hidden, cl::init(false));
+
+static cl::opt<bool>
+    ClNoSpillTypeTests("type-tests-nospill",
+                       cl::desc("Mark type test values as NoSpill, protecting "
+                                "them against stack corruption"),
+                       cl::Hidden, cl::init(false));
 
 bool BitSetInfo::containsGlobalOffset(uint64_t Offset) const {
   if (Offset < ByteOffset)
@@ -517,6 +524,8 @@ class LowerTypeTestsModule {
   /// replace each use, which is a direct function call.
   void replaceDirectCalls(Value *Old, Value *New);
 
+  void markInstructionNoSpill(Value *V);
+
 public:
   LowerTypeTestsModule(Module &M, ModuleSummaryIndex *ExportSummary,
                        const ModuleSummaryIndex *ImportSummary,
@@ -527,6 +536,8 @@ public:
   // Lower the module using the action and summary passed as command line
   // arguments. For testing purposes only.
   static bool runForTesting(Module &M);
+
+  static void markInstructionNoSpill(Value *V, LLVMContext &C);
 };
 } // end anonymous namespace
 
@@ -562,11 +573,17 @@ static Value *createMaskedBitTest(IRBuilder<> &B, Value *Bits,
   unsigned BitWidth = BitsType->getBitWidth();
 
   BitOffset = B.CreateZExtOrTrunc(BitOffset, BitsType);
+  LowerTypeTestsModule::markInstructionNoSpill(BitOffset, B.getContext());
   Value *BitIndex =
       B.CreateAnd(BitOffset, ConstantInt::get(BitsType, BitWidth - 1));
+  LowerTypeTestsModule::markInstructionNoSpill(BitIndex, B.getContext());
   Value *BitMask = B.CreateShl(ConstantInt::get(BitsType, 1), BitIndex);
+  LowerTypeTestsModule::markInstructionNoSpill(BitMask, B.getContext());
   Value *MaskedBits = B.CreateAnd(Bits, BitMask);
-  return B.CreateICmpNE(MaskedBits, ConstantInt::get(BitsType, 0));
+  LowerTypeTestsModule::markInstructionNoSpill(MaskedBits, B.getContext());
+  Value *ICMP = B.CreateICmpNE(MaskedBits, ConstantInt::get(BitsType, 0));
+  LowerTypeTestsModule::markInstructionNoSpill(ICMP, B.getContext());
+  return ICMP;
 }
 
 ByteArrayInfo *LowerTypeTestsModule::createByteArray(BitSetInfo &BSI) {
@@ -657,13 +674,19 @@ Value *LowerTypeTestsModule::createBitSetTest(IRBuilder<> &B,
       ByteArray = GlobalAlias::create(Int8Ty, 0, GlobalValue::PrivateLinkage,
                                       "bits_use", ByteArray, &M);
     }
+    markInstructionNoSpill(ByteArray);
 
     Value *ByteAddr = B.CreateGEP(Int8Ty, ByteArray, BitOffset);
+    markInstructionNoSpill(ByteAddr);
     Value *Byte = B.CreateLoad(Int8Ty, ByteAddr);
+    markInstructionNoSpill(Byte);
 
     Value *ByteAndMask =
         B.CreateAnd(Byte, ConstantExpr::getPtrToInt(TIL.BitMask, Int8Ty));
-    return B.CreateICmpNE(ByteAndMask, ConstantInt::get(Int8Ty, 0));
+    markInstructionNoSpill(ByteAndMask);
+    Value *CMP = B.CreateICmpNE(ByteAndMask, ConstantInt::get(Int8Ty, 0));
+    markInstructionNoSpill(CMP);
+    return CMP;
   }
 }
 
@@ -726,13 +749,22 @@ Value *LowerTypeTestsModule::lowerTypeTestCall(Metadata *TypeId, CallInst *CI,
   IRBuilder<> B(CI);
 
   Value *PtrAsInt = B.CreatePtrToInt(Ptr, IntPtrTy);
+  markInstructionNoSpill(PtrAsInt);
 
-  Constant *OffsetedGlobalAsInt =
-      ConstantExpr::getPtrToInt(TIL.OffsetedGlobal, IntPtrTy);
-  if (TIL.TheKind == TypeTestResolution::Single)
-    return B.CreateICmpEQ(PtrAsInt, OffsetedGlobalAsInt);
+  Value *OffsetedGlobalAsInt =
+      cast<ConstantExpr>(
+          ConstantExpr::getPtrToInt(TIL.OffsetedGlobal, IntPtrTy))
+          ->getAsInstruction(CI);
+  // This must be an instruction so that it'll keep nospill.
+  markInstructionNoSpill(OffsetedGlobalAsInt);
+  if (TIL.TheKind == TypeTestResolution::Single) {
+    Value *EQ = B.CreateICmpEQ(PtrAsInt, OffsetedGlobalAsInt);
+    markInstructionNoSpill(EQ);
+    return EQ;
+  }
 
   Value *PtrOffset = B.CreateSub(PtrAsInt, OffsetedGlobalAsInt);
+  markInstructionNoSpill(PtrOffset);
 
   // We need to check that the offset both falls within our range and is
   // suitably aligned. We can check both properties at the same time by
@@ -744,15 +776,19 @@ Value *LowerTypeTestsModule::lowerTypeTestCall(Metadata *TypeId, CallInst *CI,
   // the bitset.
   Value *OffsetSHR =
       B.CreateLShr(PtrOffset, ConstantExpr::getZExt(TIL.AlignLog2, IntPtrTy));
+  markInstructionNoSpill(OffsetSHR);
   Value *OffsetSHL = B.CreateShl(
       PtrOffset, ConstantExpr::getZExt(
                      ConstantExpr::getSub(
                          ConstantInt::get(Int8Ty, DL.getPointerSizeInBits(0)),
                          TIL.AlignLog2),
                      IntPtrTy));
+  markInstructionNoSpill(OffsetSHL);
   Value *BitOffset = B.CreateOr(OffsetSHR, OffsetSHL);
+  markInstructionNoSpill(BitOffset);
 
   Value *OffsetInRange = B.CreateICmpULE(BitOffset, TIL.SizeM1);
+  markInstructionNoSpill(OffsetInRange);
 
   // If the bit set is all ones, testing against it is unnecessary.
   if (TIL.TheKind == TypeTestResolution::AllOnes)
@@ -1080,6 +1116,15 @@ void LowerTypeTestsModule::importFunction(
         AliasesToErase.push_back(A);
       }
     }
+    auto TargetCPU = F->getFnAttribute("target-cpu");
+    if (TargetCPU.isValid())
+      FDecl->addFnAttr(TargetCPU);
+    auto TuneCPU = F->getFnAttribute("tune-cpu");
+    if (TuneCPU.isValid())
+      FDecl->addFnAttr(TuneCPU);
+    auto TargetFeatures = F->getFnAttribute("target-features");
+    if (TargetFeatures.isValid())
+      FDecl->addFnAttr(TargetFeatures);
   }
 
   if (F->hasExternalWeakLinkage())
@@ -1396,7 +1441,32 @@ void LowerTypeTestsModule::createJumpTable(
   if (JumpTableArch == Triple::riscv32 || JumpTableArch == Triple::riscv64) {
     // Make sure the jump table assembly is not modified by the assembler or
     // the linker.
+    assert(!Functions.empty());
+
+    auto TFAttr = cast<Function>(Functions[0]->getGlobal())
+                      ->getFnAttribute("target-features");
+    if (TFAttr.isValid()) {
+      SmallVector<StringRef, 6> Features;
+      bool HadC = false;
+      bool HadRelax = false;
+      TFAttr.getValueAsString().split(Features, ',');
+      for (llvm::StringRef *It = Features.begin(); It != Features.end(); It++) {
+        if (*It == "+c") {
+          *It = "-c";
+          HadC = true;
+        } else if (*It == "+relax") {
+          *It = "-relax";
+          HadRelax = true;
+        }
+      }
+      if (!HadC)
+        Features.insert(Features.end(), "-c");
+      if (!HadRelax)
+        Features.insert(Features.end(), "-relax");
+      F->addFnAttr("target-features", join(Features, ","));
+    } else {
     F->addFnAttr("target-features", "-c,-relax");
+    }
   }
   // Make sure we don't emit .eh_frame for this function.
   F->addFnAttr(Attribute::NoUnwind);
@@ -1776,6 +1846,15 @@ void LowerTypeTestsModule::replaceCfiUses(Function *Old, Value *New,
 
 void LowerTypeTestsModule::replaceDirectCalls(Value *Old, Value *New) {
   Old->replaceUsesWithIf(New, isDirectCall);
+}
+
+void LowerTypeTestsModule::markInstructionNoSpill(Value *V, LLVMContext &C) {
+  if (ClNoSpillTypeTests)
+    if (llvm::Instruction *I = dyn_cast<llvm::Instruction>(V))
+      I->setMetadata(LLVMContext::MD_nospill, llvm::MDNode::get(C, None));
+}
+void LowerTypeTestsModule::markInstructionNoSpill(Value *V) {
+  markInstructionNoSpill(V, M.getContext());
 }
 
 static void dropTypeTests(Module &M, Function &TypeTestFunc) {

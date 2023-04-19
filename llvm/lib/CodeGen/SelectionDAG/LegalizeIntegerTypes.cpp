@@ -1744,6 +1744,9 @@ bool DAGTypeLegalizer::PromoteIntegerOperand(SDNode *N, unsigned OpNo) {
   if (Res.getNode() == N)
     return true;
 
+  if(N->getNoSpill())
+    assert(Res->getNoSpill() && "Lost NoSpill while Promoting Integer Operand");
+
   const bool IsStrictFp = N->isStrictFPOpcode();
   assert(Res.getValueType() == N->getValueType(0) &&
          N->getNumValues() == (IsStrictFp ? 2 : 1) &&

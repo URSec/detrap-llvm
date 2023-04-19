@@ -1409,6 +1409,11 @@ bool MachineLICMBase::Hoist(MachineInstr *MI, MachineBasicBlock *Preheader) {
     ++NumNotHoistedDueToHotness;
     return false;
   }
+  // Check if load is CFI-sensitive
+  if(MI->getNoSpill())
+    //TODO: perform analysis to confirm this
+    return false;
+
   // First check whether we should hoist this instruction.
   if (!IsLoopInvariantInst(*MI) || !IsProfitableToHoist(*MI)) {
     // If not, try unfolding a hoistable load.

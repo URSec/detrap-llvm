@@ -996,6 +996,15 @@ public:
   void NodeDeleted(SDNode *N, SDNode *E) override {
     if (ISelPosition == SelectionDAG::allnodes_iterator(N))
       ++ISelPosition;
+
+    if(N->getNoSpill()) {
+      LLVM_DEBUG(dbgs() << "Removing NoSpill Node ");
+      LLVM_DEBUG(N->print(dbgs()));
+      if(E) {
+        LLVM_DEBUG(dbgs() << "Replaced with ");
+        LLVM_DEBUG(E->print(dbgs()));
+      }
+    }
   }
 
   /// NodeInserted - Handle new nodes inserted into the graph: propagate
@@ -1005,6 +1014,15 @@ public:
     SDNode *CurNode = &*ISelPosition;
     if (MDNode *MD = DAG.getPCSections(CurNode))
       DAG.addPCSections(N, MD);
+    if (MDNode *NoSpill = CurNode->getNoSpill()) {
+      if (N->getNoSpill() == nullptr) {
+        LLVM_DEBUG(dbgs() << "NoSpill not propagated from ");
+        LLVM_DEBUG(CurNode->printr(dbgs(), &DAG));
+        LLVM_DEBUG(dbgs() << " to ");
+        LLVM_DEBUG(N->printr(dbgs(), &DAG));
+        LLVM_DEBUG(dbgs() << "\n");
+      }
+    }
   }
 };
 

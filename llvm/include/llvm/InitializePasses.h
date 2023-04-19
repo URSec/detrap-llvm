@@ -315,6 +315,7 @@ void initializeMustExecutePrinterPass(PassRegistry&);
 void initializeMustBeExecutedContextPrinterPass(PassRegistry&);
 void initializeNaryReassociateLegacyPassPass(PassRegistry&);
 void initializeNewGVNLegacyPassPass(PassRegistry&);
+void initializeNoSpillNoStorePass(PassRegistry&);
 void initializeObjCARCAAWrapperPassPass(PassRegistry&);
 void initializeObjCARCAPElimPass(PassRegistry&);
 void initializeObjCARCContractLegacyPassPass(PassRegistry &);

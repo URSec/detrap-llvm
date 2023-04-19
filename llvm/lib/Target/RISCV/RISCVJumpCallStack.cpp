@@ -22,35 +22,38 @@
 //
 //===----------------------------------------------------------------------===//
 
+// https://discourse.llvm.org/t/rfc-pc-keyed-metadata-at-runtime/64191
+
 #include "MCTargetDesc/RISCVBaseInfo.h"
-#include "MCTargetDesc/RISCVMCTargetDesc.h"
 #include "RISCV.h"
 #include "RISCVInstrInfo.h"
-#include "RISCVMachineFunctionInfo.h"
+#include "RISCVSubtarget.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallString.h"
+#include "llvm/ADT/StringRef.h"
 #include "llvm/BinaryFormat/ELF.h"
 #include "llvm/CodeGen/LivePhysRegs.h"
 #include "llvm/CodeGen/MachineBasicBlock.h"
+#include "llvm/CodeGen/MachineFrameInfo.h"
 #include "llvm/CodeGen/MachineFunction.h"
-#include "llvm/CodeGen/MachineFunctionPass.h"
 #include "llvm/CodeGen/MachineInstr.h"
-#include "llvm/CodeGen/MachineInstrBuilder.h"
 #include "llvm/CodeGen/MachineModuleInfo.h"
 #include "llvm/CodeGen/MachineOperand.h"
 #include "llvm/CodeGen/MachineOptimizationRemarkEmitter.h"
-#include "llvm/CodeGen/Passes.h"
 #include "llvm/IR/DiagnosticInfo.h"
 #include "llvm/IR/GlobalValue.h"
+#include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/Metadata.h"
 #include "llvm/MC/MCContext.h"
 #include "llvm/MC/MCExpr.h"
 #include "llvm/MC/MCSymbolELF.h"
 #include "llvm/Support/Casting.h"
+#include "llvm/Support/CommandLine.h"
 #include "llvm/Support/ErrorHandling.h"
 #include "llvm/Support/SMLoc.h"
 #include "llvm/Support/raw_ostream.h"
-#include "llvm/Target/TargetOptions.h"
+#include <string>
+#include <utility>
 
 using namespace llvm;
 
@@ -131,6 +134,24 @@ static cl::opt<bool> ClJumpCallStackAlwaysScan(
              "even if no functions use the jumpoline"),
     cl::Hidden, cl::init(false));
 
+static cl::opt<bool> ClJumpCallStackCheckPointerSpills(
+    "jump-call-stack-check-pointers",
+    cl::desc("Perform code scanning for loaded jumptable addresses"
+             "that are immediately spilled to the stack"),
+    cl::Hidden, cl::init(true));
+
+static cl::opt<bool> ClJumpCallStackCheckPointerSpillsError(
+    "jump-call-stack-check-pointers-error",
+    cl::desc(
+        "Throw an error if jump-call-stack-check-pointers finds a problem"),
+    cl::Hidden, cl::init(false));
+
+static cl::list<std::string> ClJumpCallStackExternalLeafFunctions(
+    "jump-call-stack-external-leaf",
+    cl::desc("External (e.g.: assembly) leaf functions that do not need JCS "
+             "and should be exempt from warnings"),
+    cl::Hidden);
+
 namespace {
 
 enum CallStackMethod {
@@ -161,7 +182,10 @@ static CallStackMethod getFunctionCSM(const Function &F) {
 struct RISCVJumpCallStack : public ModulePass {
   static char ID;
   bool runOnModule(Module &M) override;
-  RISCVJumpCallStack() : ModulePass(ID) {}
+  RISCVJumpCallStack() : ModulePass(ID) {
+    ExternalLeafFunctions.insert(ClJumpCallStackExternalLeafFunctions.begin(),
+                                 ClJumpCallStackExternalLeafFunctions.end());
+  }
 
   StringRef getPassName() const override {
     return RISCV_JUMP_CALL_STACK_OPTIMIZE_NAME;
@@ -174,9 +198,12 @@ struct RISCVJumpCallStack : public ModulePass {
   }
 
 private:
+  std::set<std::string> ExternalLeafFunctions;
+
   bool runExpandPEOnMachineFunction(MachineFunction &Fn, CallStackMethod CSM);
   bool runFixCallOnMachineFunction(MachineFunction &Fn, bool DoFixCallers);
   void runVerifyCallOnMachineFunction(MachineFunction &MF);
+  void runVerifyNoStackSaveOnMachineFunction(MachineFunction &MF);
   bool expandCall(MachineBasicBlock &MBB, MachineBasicBlock::iterator MBBI,
                   MachineBasicBlock::iterator &NextMBBI,
                   MachineOptimizationRemarkEmitter &MORE,
@@ -259,6 +286,16 @@ bool RISCVJumpCallStack::runOnModule(Module &M) {
     }
   }
 
+  if (ClJumpCallStackCheckPointerSpills)
+    for (const Function &F : M.functions()) {
+      MachineFunction *MaybeMF = MMI.getMachineFunction(F);
+      if (!MaybeMF)
+        continue;
+      const CallStackMethod CSM = getFunctionCSM(F);
+      if (CSM == JCS_JumpTableCompressed)
+        runVerifyNoStackSaveOnMachineFunction(*MaybeMF);
+    }
+
   return Changed;
 }
 
@@ -278,9 +315,10 @@ static bool findInstrumentNOP(MachineInstr &MI) {
   return false;
 }
 
-static bool findInstrumentNOP(MachineInstr &MI, uint_least16_t Flags) {
+static bool
+findInstrumentNOP(MachineInstr &MI,
+                  decltype(std::declval<MachineInstr>().getFlags()) Flags) {
   auto MIFlags = MI.getFlags();
-  static_assert(sizeof(Flags) >= sizeof(MIFlags), "Flags too small");
   if (MIFlags & Flags || !Flags)
     return findInstrumentNOP(MI);
   return false;
@@ -339,12 +377,12 @@ void RISCVJumpCallStack::insertJCSPrologueJump(
     std::string MOS;
     raw_string_ostream RSO(MOS);
     MachineOptimizationRemark R(DEBUG_TYPE, "JumpCallStackAdded", DL, &MBB);
-    const User *user = nullptr;
+    const User *User = nullptr;
     RSO << "; ext=" << F.hasExternalLinkage()
-        << "; addr=" << F.hasAddressTaken(&user)
+        << "; addr=" << F.hasAddressTaken(&User)
         << "; weak=" << F.isWeakForLinker();
-    if (user)
-      RSO << "; user=" << user->getName();
+    if (User)
+      RSO << "; user=" << User->getName();
     R << "Added jumpoline jump and label to " << MF.getName() << MOS;
     MORE.emit(R);
     if (ClJumpCallStackOverflowCheck) {
@@ -378,7 +416,7 @@ void RISCVJumpCallStack::insertJCSPrologueJump(
           ELFLabel->setBinding(ELF::STB_GLOBAL);
         }
       }
-      dyn_cast<MCSymbolELF>(Label)->setType(ELF::STT_FUNC);
+      ELFLabel->setType(ELF::STT_FUNC);
     }
     BuildMI(MBB, MBBI, DL, TII->get(RISCV::EH_LABEL))
         .addSym(Label)
@@ -734,8 +772,11 @@ static void checkJumpTail(MachineBasicBlock &MBB,
   if (OrigName.equals(ClJumpCallStackJumpoline) ||
       OrigName.equals(ClJumpCallStackJumpolineTail) || 
       OrigName.equals(ClJumpCallStackJumpolinePop)) {
-    MF->getContext().reportError(
-        SMLoc(), "jump to a trampoline in (checkJumpTail)" + MF->getName());
+    MF->getFunction().getContext().diagnose(DiagnosticInfoUnsupported(
+        MF->getFunction(),
+        "jump to a trampoine in (checkJumpTail) " + MF->getName(),
+        MI.getDebugLoc(), DS_Error));
+    report_fatal_error("Failed to exit after error");
   }
 }
 
@@ -810,10 +851,11 @@ bool RISCVJumpCallStack::expandCall(
   if (OrigName.equals(ClJumpCallStackJumpoline) ||
       OrigName.equals(ClJumpCallStackJumpolineTail) ||
       OrigName.equals(ClJumpCallStackJumpolinePop)) {
-    MF->getContext().reportError(
-        SMLoc(), "jump to a trampoline in (expandCall)" + MF->getName());
-    // MI.emitError("jumps to a trampoline");
-    // report_fatal_error("Somehow returned from emitError");
+    MF->getFunction().getContext().diagnose(DiagnosticInfoUnsupported(
+        MF->getFunction(),
+        "jump to a trampoine in (expandCall) " + MF->getName(),
+        MI.getDebugLoc(), DS_Error));
+    report_fatal_error("Failed to exit after error");
   }
 
   {
@@ -875,9 +917,14 @@ bool RISCVJumpCallStack::expandCall(
       }
     }
     if (!DestSym) {
+      bool IsExtLeafFunction = ExternalLeafFunctions.find(OrigName.str()) !=
+                               ExternalLeafFunctions.end();
       MachineOptimizationRemark R(DEBUG_TYPE, "NotFixedNoDest", DL, &MBB);
       R << "Not fixing [no DestSym=" << NewName << "] from " << OrigName;
+      if (IsExtLeafFunction)
+        R << " (is an External Leaf Function)";
       MORE.emit(R);
+      if (!IsExtLeafFunction)
       reportCallToBadFromJCS(*MF, MI, OrigName, "non-JCS");
       // no rewrite symbol; just continue
       return false;
@@ -1010,6 +1057,44 @@ void RISCVJumpCallStack::runVerifyCallOnMachineFunction(MachineFunction &MF) {
         break;
       case RISCV::PseudoJump:
         checkOpName(getOperandName(MI.getOperand(1)), MI, MORE);
+      }
+    }
+  }
+}
+
+void RISCVJumpCallStack::runVerifyNoStackSaveOnMachineFunction(
+    MachineFunction &MF) {
+  auto &MC = MF.getContext();
+  StringRef Name;
+  for (MachineBasicBlock &MBB : MF) {
+    Register R = RISCV::X0;
+    for (auto MII = MBB.begin(); MII != MBB.end(); ++MII) {
+      switch (MII->getOpcode()) {
+      default:
+        R = RISCV::X0;
+        break;
+      case RISCV::PseudoLLA:
+      case RISCV::PseudoLA:
+      case RISCV::PseudoLI: {
+        auto &Op = MII->getOperand(1);
+        if (Op.isGlobal())
+          Name = Op.getGlobal()->getName();
+        else if (Op.isMCSymbol())
+          Name = Op.getMCSymbol()->getName();
+        R = (Name.startswith(".cfi.jumptable") || Name.startswith(".LJTI"))
+                ? MII->getOperand(0).getReg()
+                : RISCV::X0;
+      } break;
+      case RISCV::SW:
+      case RISCV::SD:
+        if (R != RISCV::X0)
+          if (R == MII->getOperand(0).getReg())
+            MC.reportWarning(SMLoc(), "Jumptable \"" + Name +
+                                          "\" address is spilled to stack in " +
+                                          MF.getName());
+        if (ClJumpCallStackCheckPointerSpillsError)
+          assert(R != MII->getOperand(0).getReg());
+        R = RISCV::X0;
       }
     }
   }

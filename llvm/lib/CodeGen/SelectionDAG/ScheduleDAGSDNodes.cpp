@@ -893,6 +893,9 @@ EmitSchedule(MachineBasicBlock::iterator &InsertPos) {
     if (MDNode *MD = DAG->getPCSections(Node))
       MI->setPCSections(MF, MD);
 
+    if(MDNode *MD = Node->getNoSpill())
+      MI->setNoSpill(MF, MD);
+
     return MI;
   };
 

@@ -129,6 +129,11 @@ static cl::opt<unsigned> SwitchPeelThreshold(
              "switch statement. A value greater than 100 will void this "
              "optimization"));
 
+static cl::opt<bool>
+    NoSpillJumpTables("jump-tables-nospill", cl::Hidden, cl::init(false),
+                      cl::desc("Use NoSpill when generating jumptable switches "
+                               "to protect them against stack corruption"));
+
 // Limit the width of DAG chains. This is important in general to prevent
 // DAG-based analysis from blowing up. For example, alias analysis and
 // load clustering may not complete in reasonable time. It is difficult to
@@ -1127,7 +1132,8 @@ void SelectionDAGBuilder::visit(const Instruction &I) {
   bool NodeInserted = false;
   std::unique_ptr<SelectionDAG::DAGNodeInsertedListener> InsertedListener;
   MDNode *PCSectionsMD = I.getMetadata(LLVMContext::MD_pcsections);
-  if (PCSectionsMD) {
+  MDNode *NoSpillMD = I.getMetadata(LLVMContext::MD_nospill);
+  if (PCSectionsMD || NoSpillMD) {
     InsertedListener = std::make_unique<SelectionDAG::DAGNodeInsertedListener>(
         DAG, [&](SDNode *) { NodeInserted = true; });
   }
@@ -1148,6 +1154,27 @@ void SelectionDAGBuilder::visit(const Instruction &I) {
       // fix it. Relevant visit*() function is probably missing a setValue().
       errs() << "warning: loosing !pcsections metadata ["
              << I.getModule()->getName() << "]\n";
+      LLVM_DEBUG(I.dump());
+      assert(false);
+    }
+  }
+
+  if (NoSpillMD) {
+    auto It = NodeMap.find(&I);
+    if (It != NodeMap.end()) {
+      if (NoSpillMD && It->second.getNode()->getNoSpill() != NoSpillMD) {
+        LLVM_DEBUG(errs() << "warning: NoSpill not transferred from:");
+        LLVM_DEBUG(I.print(errs(), true));
+        LLVM_DEBUG(errs() << "\n    to:");
+        LLVM_DEBUG(It->second.getNode()->print(errs(), &DAG));
+        LLVM_DEBUG(errs() << "\n");
+        assert(false);
+      }
+    } else if (NodeInserted) {
+      // This should not happen; if it does, don't let it go unnoticed so we can
+      // fix it. Relevant visit*() function is probably missing a setValue().
+      LLVM_DEBUG(errs() << "warning: loosing !nospill metadata ["
+                        << I.getModule()->getName() << "]\n");
       LLVM_DEBUG(I.dump());
       assert(false);
     }
@@ -1507,11 +1534,16 @@ SDValue SelectionDAGBuilder::getCopyFromRegs(const Value *V, Type *Ty) {
 }
 
 /// getValue - Return an SDValue for the given Value.
-SDValue SelectionDAGBuilder::getValue(const Value *V) {
+SDValue SelectionDAGBuilder::getValue(const Value *V, MDNode *NoSpill) {
   // If we already have an SDValue for this value, use it. It's important
   // to do this first, so that we don't create a CopyFromReg if we already
   // have a regular SDValue.
   SDValue &N = NodeMap[V];
+
+  if (N.getNode() && NoSpill)
+    if(!N->getNoSpill())
+      N->setNoSpill(NoSpill);
+
   if (N.getNode()) return N;
 
   // If there's a virtual register allocated and initialized for this
@@ -1520,7 +1552,7 @@ SDValue SelectionDAGBuilder::getValue(const Value *V) {
     return copyFromReg;
 
   // Otherwise create a new SDValue and remember it.
-  SDValue Val = getValueImpl(V);
+  SDValue Val = getValueImpl(V, NoSpill);
   NodeMap[V] = Val;
   resolveDanglingDebugInfo(V, Val);
   return Val;
@@ -1528,7 +1560,7 @@ SDValue SelectionDAGBuilder::getValue(const Value *V) {
 
 /// getNonRegisterValue - Return an SDValue for the given Value, but
 /// don't look in FuncInfo.ValueMap for a virtual register.
-SDValue SelectionDAGBuilder::getNonRegisterValue(const Value *V) {
+SDValue SelectionDAGBuilder::getNonRegisterValue(const Value *V, MDNode *NoSpill) {
   // If we already have an SDValue for this value, use it.
   SDValue &N = NodeMap[V];
   if (N.getNode()) {
@@ -1543,7 +1575,7 @@ SDValue SelectionDAGBuilder::getNonRegisterValue(const Value *V) {
   }
 
   // Otherwise create a new SDValue and remember it.
-  SDValue Val = getValueImpl(V);
+  SDValue Val = getValueImpl(V, NoSpill);
   NodeMap[V] = Val;
   resolveDanglingDebugInfo(V, Val);
   return Val;
@@ -1551,17 +1583,21 @@ SDValue SelectionDAGBuilder::getNonRegisterValue(const Value *V) {
 
 /// getValueImpl - Helper function for getValue and getNonRegisterValue.
 /// Create an SDValue for the given value.
-SDValue SelectionDAGBuilder::getValueImpl(const Value *V) {
+SDValue SelectionDAGBuilder::getValueImpl(const Value *V, MDNode *NoSpill) {
   const TargetLowering &TLI = DAG.getTargetLoweringInfo();
+
+  auto DL = getCurSDLoc();
+  if(NoSpill)
+    DL = DL.getWithNoSpill(NoSpill);
 
   if (const Constant *C = dyn_cast<Constant>(V)) {
     EVT VT = TLI.getValueType(DAG.getDataLayout(), V->getType(), true);
 
     if (const ConstantInt *CI = dyn_cast<ConstantInt>(C))
-      return DAG.getConstant(*CI, getCurSDLoc(), VT);
+      return DAG.getConstant(*CI, DL, VT);
 
     if (const GlobalValue *GV = dyn_cast<GlobalValue>(C))
-      return DAG.getGlobalAddress(GV, getCurSDLoc(), VT);
+      return DAG.getGlobalAddress(GV, DL, VT);
 
     if (isa<ConstantPointerNull>(C)) {
       unsigned AS = V->getType()->getPointerAddressSpace();
@@ -2466,9 +2502,14 @@ void SelectionDAGBuilder::visitBr(const BranchInst &I) {
     }
   }
 
+  auto DL = getCurSDLoc();
+  if(BOp)
+    if(MDNode *NoSpill = BOp->getMetadata(LLVMContext::MD_nospill))
+      DL = DL.getWithNoSpill(NoSpill);
+
   // Create a CaseBlock record representing this branch.
   CaseBlock CB(ISD::SETEQ, CondVal, ConstantInt::getTrue(*DAG.getContext()),
-               nullptr, Succ0MBB, Succ1MBB, BrMBB, getCurSDLoc());
+               nullptr, Succ0MBB, Succ1MBB, BrMBB, DL);
 
   // Use visitSwitchCase to actually insert the fast branch sequence for this
   // cond branch.
@@ -2575,11 +2616,18 @@ void SelectionDAGBuilder::visitSwitchCase(CaseBlock &CB,
 void SelectionDAGBuilder::visitJumpTable(SwitchCG::JumpTable &JT) {
   // Emit the code for the jump table
   assert(JT.Reg != -1U && "Should lower JT Header first!");
+  MDNode *NoSpill = nullptr;
+  SDLoc DL = getCurSDLoc();
+  if(NoSpillJumpTables) {
+      NoSpill = MDNode::get(*DAG.getContext(), None);
+      DL = DL.getWithNoSpill(NoSpill);
+  }
   EVT PTy = DAG.getTargetLoweringInfo().getPointerTy(DAG.getDataLayout());
+  // TODO: Maybe use DL instead of getCurSDLoc() to pass NoSpill at index creation?
   SDValue Index = DAG.getCopyFromReg(getControlRoot(), getCurSDLoc(),
                                      JT.Reg, PTy);
-  SDValue Table = DAG.getJumpTable(JT.JTI, PTy);
-  SDValue BrJumpTable = DAG.getNode(ISD::BR_JT, getCurSDLoc(),
+  SDValue Table = DAG.getJumpTable(JT.JTI, PTy, false, 0, NoSpill);
+  SDValue BrJumpTable = DAG.getNode(ISD::BR_JT, DL,
                                     MVT::Other, Index.getValue(1),
                                     Table, Index);
   DAG.setRoot(BrJumpTable);
@@ -2616,6 +2664,8 @@ void SelectionDAGBuilder::visitJumpTableHeader(SwitchCG::JumpTable &JT,
     // Emit the range check for the jump table, and branch to the default block
     // for the switch statement if the value being switched on exceeds the
     // largest case in the switch.
+    if (NoSpillJumpTables)
+      dl = dl.getWithNoSpill(MDNode::get(*DAG.getContext(), None));
     SDValue CMP = DAG.getSetCC(
         dl, TLI.getSetCCResultType(DAG.getDataLayout(), *DAG.getContext(),
                                    Sub.getValueType()),
@@ -3234,6 +3284,32 @@ void SelectionDAGBuilder::visitICmp(const User &I) {
   SDValue Op2 = getValue(I.getOperand(1));
   ISD::CondCode Opcode = getICmpCondCode(predicate);
 
+  if (const auto *Inst = dyn_cast<Instruction>(&I)) {
+    if (auto *MD = Inst->getMetadata(LLVMContext::MD_nospill)) {
+      auto const *CI1 = dyn_cast<ConstantInt>(I.getOperand(0));
+      auto const *CI2 = dyn_cast<ConstantInt>(I.getOperand(1));
+      if (CI1 || CI2) {
+        assert(getCurSDLoc().getNoSpill() &&
+               "Instruction with NoSpill but not present in SDLoc");
+        auto SDL = getCurSDLoc();
+        if(!SDL.getNoSpill())
+          SDL = SDL.getWithNoSpill(MD);
+        auto InsertConstantNode = [this, SDL](const ConstantInt *CI) {
+          const TargetLowering &TLI = DAG.getTargetLoweringInfo();
+          EVT VT = TLI.getValueType(DAG.getDataLayout(), CI->getType(), true);
+          auto V = DAG.getConstant(*CI, SDL, VT, false, false);
+          return V;
+        };
+        if (CI1) {
+          Op1 = InsertConstantNode(CI1);
+        }
+        if (CI2) {
+          Op2 = InsertConstantNode(CI2);
+        }
+      }
+    }
+  }
+
   auto &TLI = DAG.getTargetLoweringInfo();
   EVT MemVT =
       TLI.getMemValueType(DAG.getDataLayout(), I.getOperand(0)->getType());
@@ -3499,14 +3575,18 @@ void SelectionDAGBuilder::visitSIToFP(const User &I) {
 void SelectionDAGBuilder::visitPtrToInt(const User &I) {
   // What to do depends on the size of the integer and the size of the pointer.
   // We can either truncate, zero extend, or no-op, accordingly.
-  SDValue N = getValue(I.getOperand(0));
+  MDNode *NoSpill = nullptr;
+  if(auto *Inst = dyn_cast<Instruction>(&I))
+    NoSpill = Inst->getMetadata(LLVMContext::MD_nospill);
+  SDValue N = getValue(I.getOperand(0), NoSpill);
+  assert(NoSpill == N->getNoSpill() && "PtrToInt with NoSpill");
   auto &TLI = DAG.getTargetLoweringInfo();
   EVT DestVT = DAG.getTargetLoweringInfo().getValueType(DAG.getDataLayout(),
                                                         I.getType());
   EVT PtrMemVT =
       TLI.getMemValueType(DAG.getDataLayout(), I.getOperand(0)->getType());
-  N = DAG.getPtrExtOrTrunc(N, getCurSDLoc(), PtrMemVT);
-  N = DAG.getZExtOrTrunc(N, getCurSDLoc(), DestVT);
+  N = DAG.getPtrExtOrTrunc(N, getCurSDLoc().getWithNoSpill(NoSpill), PtrMemVT);
+  N = DAG.getZExtOrTrunc(N, getCurSDLoc().getWithNoSpill(NoSpill), DestVT);
   setValue(&I, N);
 }
 
@@ -10070,6 +10150,8 @@ void TargetLowering::LowerOperationWrapper(SDNode *N,
 
   if (!Res.getNode())
     return;
+  
+  assert(Res->getNoSpill() == N->getNoSpill() && "Nospill not propagated");
 
   // If the original node has one result, take the return value from
   // LowerOperation as is. It might not be result number 0.

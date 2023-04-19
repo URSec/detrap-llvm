@@ -503,6 +503,11 @@ void ConstantHoistingPass::collectConstantCandidates(
   if (Inst->isCast())
     return;
 
+  // For now, all NoSpills are not hoistable; once implemented, proper analysis
+  // might permit some hoisting.
+  if (Inst->getMetadata(LLVMContext::MD_nospill))
+    return;
+
   // Scan all operands.
   for (unsigned Idx = 0, E = Inst->getNumOperands(); Idx != E; ++Idx) {
     // The cost of materializing the constants (defined in

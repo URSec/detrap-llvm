@@ -610,6 +610,9 @@ private:
   /// Source line information.
   DebugLoc debugLoc;
 
+  /// NoSpill Information
+  MDNode *NoSpill = nullptr;
+
   /// Return a pointer to the specified value type.
   static const EVT *getValueTypeList(EVT VT);
 
@@ -730,6 +733,10 @@ public:
   /// Set source location info.  Try to avoid this, putting
   /// it in the constructor is preferable.
   void setDebugLoc(DebugLoc dl) { debugLoc = std::move(dl); }
+
+  MDNode *getNoSpill() const { return NoSpill; }
+
+  void setNoSpill(MDNode *NoSpill);
 
   /// This class provides iterator support for SDUse
   /// operands that use a specific SDNode.
@@ -1071,9 +1078,10 @@ protected:
   ///
   /// SDNodes are created without any operands, and never own the operand
   /// storage. To add operands, see SelectionDAG::createOperands.
-  SDNode(unsigned Opc, unsigned Order, DebugLoc dl, SDVTList VTs)
+  SDNode(unsigned Opc, unsigned Order, DebugLoc dl, MDNode *NoSpill,
+         SDVTList VTs)
       : NodeType(Opc), ValueList(VTs.VTs), NumValues(VTs.NumVTs),
-        IROrder(Order), debugLoc(std::move(dl)) {
+        IROrder(Order), debugLoc(std::move(dl)), NoSpill(NoSpill) {
     memset(&RawSDNodeBits, 0, sizeof(RawSDNodeBits));
     assert(debugLoc.hasTrivialDestructor() && "Expected trivial destructor");
     assert(NumValues == VTs.NumVTs &&
@@ -1097,12 +1105,16 @@ class SDLoc {
 private:
   DebugLoc DL;
   int IROrder = 0;
+  MDNode *NoSpill = nullptr;
 
 public:
   SDLoc() = default;
-  SDLoc(const SDNode *N) : DL(N->getDebugLoc()), IROrder(N->getIROrder()) {}
+  SDLoc(const SDNode *N)
+      : DL(N->getDebugLoc()), IROrder(N->getIROrder()),
+        NoSpill(N->getNoSpill()) {}
   SDLoc(const SDValue V) : SDLoc(V.getNode()) {}
-  SDLoc(const Instruction *I, int Order) : IROrder(Order) {
+  SDLoc(const Instruction *I, int Order)
+      : IROrder(Order), NoSpill(I->getMetadata(LLVMContext::MD_nospill)) {
     assert(Order >= 0 && "bad IROrder");
     if (I)
       DL = I->getDebugLoc();
@@ -1110,6 +1122,13 @@ public:
 
   unsigned getIROrder() const { return IROrder; }
   const DebugLoc &getDebugLoc() const { return DL; }
+  MDNode *getNoSpill() const { return NoSpill; }
+
+  __attribute__((warn_unused_result)) SDLoc getWithNoSpill(MDNode *NoSpill) {
+    auto Ret = *this;
+    Ret.NoSpill = NoSpill;
+    return Ret;
+  }
 };
 
 // Define inline functions from the SDValue class.
@@ -1225,7 +1244,8 @@ class HandleSDNode : public SDNode {
 
 public:
   explicit HandleSDNode(SDValue X)
-    : SDNode(ISD::HANDLENODE, 0, DebugLoc(), getSDVTList(MVT::Other)) {
+      : SDNode(ISD::HANDLENODE, 0, DebugLoc(), nullptr,
+               getSDVTList(MVT::Other)) {
     // HandleSDNodes are never inserted into the DAG, so they won't be
     // auto-numbered. Use ID 65535 as a sentinel.
     PersistentId = 0xffff;
@@ -1250,8 +1270,8 @@ private:
   unsigned DestAddrSpace;
 
 public:
-  AddrSpaceCastSDNode(unsigned Order, const DebugLoc &dl, EVT VT,
-                      unsigned SrcAS, unsigned DestAS);
+  AddrSpaceCastSDNode(unsigned Order, const DebugLoc &dl, MDNode *NoSpill,
+                      EVT VT, unsigned SrcAS, unsigned DestAS);
 
   unsigned getSrcAddressSpace() const { return SrcAddrSpace; }
   unsigned getDestAddressSpace() const { return DestAddrSpace; }
@@ -1272,8 +1292,8 @@ protected:
   MachineMemOperand *MMO;
 
 public:
-  MemSDNode(unsigned Opc, unsigned Order, const DebugLoc &dl, SDVTList VTs,
-            EVT memvt, MachineMemOperand *MMO);
+  MemSDNode(unsigned Opc, unsigned Order, const DebugLoc &dl, MDNode *NoSpill,
+            SDVTList VTs, EVT memvt, MachineMemOperand *MMO);
 
   bool readMem() const { return MMO->isLoad(); }
   bool writeMem() const { return MMO->isStore(); }
@@ -1435,7 +1455,7 @@ class AtomicSDNode : public MemSDNode {
 public:
   AtomicSDNode(unsigned Opc, unsigned Order, const DebugLoc &dl, SDVTList VTL,
                EVT MemVT, MachineMemOperand *MMO)
-    : MemSDNode(Opc, Order, dl, VTL, MemVT, MMO) {
+    : MemSDNode(Opc, Order, dl, nullptr, VTL, MemVT, MMO) {
     assert(((Opc != ISD::ATOMIC_LOAD && Opc != ISD::ATOMIC_STORE) ||
             MMO->isAtomic()) && "then why are we using an AtomicSDNode?");
   }
@@ -1490,8 +1510,9 @@ public:
 class MemIntrinsicSDNode : public MemSDNode {
 public:
   MemIntrinsicSDNode(unsigned Opc, unsigned Order, const DebugLoc &dl,
-                     SDVTList VTs, EVT MemoryVT, MachineMemOperand *MMO)
-      : MemSDNode(Opc, Order, dl, VTs, MemoryVT, MMO) {
+                     MDNode *NoSpill, SDVTList VTs, EVT MemoryVT,
+                     MachineMemOperand *MMO)
+      : MemSDNode(Opc, Order, dl, NoSpill, VTs, MemoryVT, MMO) {
     SDNodeBits.IsMemIntrinsic = true;
   }
 
@@ -1522,7 +1543,8 @@ protected:
   friend class SelectionDAG;
 
   ShuffleVectorSDNode(EVT VT, unsigned Order, const DebugLoc &dl, const int *M)
-      : SDNode(ISD::VECTOR_SHUFFLE, Order, dl, getSDVTList(VT)), Mask(M) {}
+      : SDNode(ISD::VECTOR_SHUFFLE, Order, dl, nullptr, getSDVTList(VT)),
+        Mask(M) {}
 
 public:
   ArrayRef<int> getMask() const {
@@ -1576,9 +1598,10 @@ class ConstantSDNode : public SDNode {
 
   const ConstantInt *Value;
 
-  ConstantSDNode(bool isTarget, bool isOpaque, const ConstantInt *val, EVT VT)
+  ConstantSDNode(bool isTarget, bool isOpaque, const ConstantInt *val, EVT VT,
+                 MDNode *NoSpill = nullptr)
       : SDNode(isTarget ? ISD::TargetConstant : ISD::Constant, 0, DebugLoc(),
-               getSDVTList(VT)),
+               NoSpill, getSDVTList(VT)),
         Value(val) {
     ConstantSDNodeBits.IsOpaque = isOpaque;
   }
@@ -1627,7 +1650,7 @@ class ConstantFPSDNode : public SDNode {
 
   ConstantFPSDNode(bool isTarget, const ConstantFP *val, EVT VT)
       : SDNode(isTarget ? ISD::TargetConstantFP : ISD::ConstantFP, 0,
-               DebugLoc(), getSDVTList(VT)),
+               DebugLoc(), nullptr, getSDVTList(VT)),
         Value(val) {}
 
 public:
@@ -1749,7 +1772,7 @@ class GlobalAddressSDNode : public SDNode {
   unsigned TargetFlags;
 
   GlobalAddressSDNode(unsigned Opc, unsigned Order, const DebugLoc &DL,
-                      const GlobalValue *GA, EVT VT, int64_t o,
+                      MDNode *NoSpill, const GlobalValue *GA, EVT VT, int64_t o,
                       unsigned TF);
 
 public:
@@ -1774,7 +1797,7 @@ class FrameIndexSDNode : public SDNode {
 
   FrameIndexSDNode(int fi, EVT VT, bool isTarg)
     : SDNode(isTarg ? ISD::TargetFrameIndex : ISD::FrameIndex,
-      0, DebugLoc(), getSDVTList(VT)), FI(fi) {
+      0, DebugLoc(), nullptr, getSDVTList(VT)), FI(fi) {
   }
 
 public:
@@ -1795,7 +1818,7 @@ class LifetimeSDNode : public SDNode {
 
   LifetimeSDNode(unsigned Opcode, unsigned Order, const DebugLoc &dl,
                  SDVTList VTs, int64_t Size, int64_t Offset)
-      : SDNode(Opcode, Order, dl, VTs), Size(Size), Offset(Offset) {}
+      : SDNode(Opcode, Order, dl, nullptr, VTs), Size(Size), Offset(Offset) {}
 public:
   int64_t getFrameIndex() const {
     return cast<FrameIndexSDNode>(getOperand(1))->getIndex();
@@ -1830,7 +1853,7 @@ class PseudoProbeSDNode : public SDNode {
 
   PseudoProbeSDNode(unsigned Opcode, unsigned Order, const DebugLoc &Dl,
                     SDVTList VTs, uint64_t Guid, uint64_t Index, uint32_t Attr)
-      : SDNode(Opcode, Order, Dl, VTs), Guid(Guid), Index(Index),
+      : SDNode(Opcode, Order, Dl, nullptr, VTs), Guid(Guid), Index(Index),
         Attributes(Attr) {}
 
 public:
@@ -1850,9 +1873,9 @@ class JumpTableSDNode : public SDNode {
   int JTI;
   unsigned TargetFlags;
 
-  JumpTableSDNode(int jti, EVT VT, bool isTarg, unsigned TF)
+  JumpTableSDNode(int jti, EVT VT, bool isTarg, unsigned TF, MDNode *NoSpill)
     : SDNode(isTarg ? ISD::TargetJumpTable : ISD::JumpTable,
-      0, DebugLoc(), getSDVTList(VT)), JTI(jti), TargetFlags(TF) {
+      0, DebugLoc(), NoSpill, getSDVTList(VT)), JTI(jti), TargetFlags(TF) {
   }
 
 public:
@@ -1879,7 +1902,7 @@ class ConstantPoolSDNode : public SDNode {
   ConstantPoolSDNode(bool isTarget, const Constant *c, EVT VT, int o,
                      Align Alignment, unsigned TF)
       : SDNode(isTarget ? ISD::TargetConstantPool : ISD::ConstantPool, 0,
-               DebugLoc(), getSDVTList(VT)),
+               DebugLoc(), nullptr, getSDVTList(VT)),
         Offset(o), Alignment(Alignment), TargetFlags(TF) {
     assert(Offset >= 0 && "Offset is too large");
     Val.ConstVal = c;
@@ -1888,7 +1911,7 @@ class ConstantPoolSDNode : public SDNode {
   ConstantPoolSDNode(bool isTarget, MachineConstantPoolValue *v, EVT VT, int o,
                      Align Alignment, unsigned TF)
       : SDNode(isTarget ? ISD::TargetConstantPool : ISD::ConstantPool, 0,
-               DebugLoc(), getSDVTList(VT)),
+               DebugLoc(), nullptr, getSDVTList(VT)),
         Offset(o), Alignment(Alignment), TargetFlags(TF) {
     assert(Offset >= 0 && "Offset is too large");
     Val.MachineCPVal = v;
@@ -1937,7 +1960,7 @@ class TargetIndexSDNode : public SDNode {
 
 public:
   TargetIndexSDNode(int Idx, EVT VT, int64_t Ofs, unsigned TF)
-      : SDNode(ISD::TargetIndex, 0, DebugLoc(), getSDVTList(VT)),
+      : SDNode(ISD::TargetIndex, 0, DebugLoc(), nullptr, getSDVTList(VT)),
         TargetFlags(TF), Index(Idx), Offset(Ofs) {}
 
   unsigned getTargetFlags() const { return TargetFlags; }
@@ -1958,8 +1981,9 @@ class BasicBlockSDNode : public SDNode {
   /// blocks out of order when they're jumped to, which makes it a bit
   /// harder.  Let's see if we need it first.
   explicit BasicBlockSDNode(MachineBasicBlock *mbb)
-    : SDNode(ISD::BasicBlock, 0, DebugLoc(), getSDVTList(MVT::Other)), MBB(mbb)
-  {}
+      : SDNode(ISD::BasicBlock, 0, DebugLoc(), nullptr,
+               getSDVTList(MVT::Other)),
+        MBB(mbb) {}
 
 public:
   MachineBasicBlock *getBasicBlock() const { return MBB; }
@@ -2115,7 +2139,8 @@ class SrcValueSDNode : public SDNode {
 
   /// Create a SrcValue for a general value.
   explicit SrcValueSDNode(const Value *v)
-    : SDNode(ISD::SRCVALUE, 0, DebugLoc(), getSDVTList(MVT::Other)), V(v) {}
+      : SDNode(ISD::SRCVALUE, 0, DebugLoc(), nullptr, getSDVTList(MVT::Other)),
+        V(v) {}
 
 public:
   /// Return the contained Value.
@@ -2132,8 +2157,9 @@ class MDNodeSDNode : public SDNode {
   const MDNode *MD;
 
   explicit MDNodeSDNode(const MDNode *md)
-  : SDNode(ISD::MDNODE_SDNODE, 0, DebugLoc(), getSDVTList(MVT::Other)), MD(md)
-  {}
+      : SDNode(ISD::MDNODE_SDNODE, 0, DebugLoc(), nullptr,
+               getSDVTList(MVT::Other)),
+        MD(md) {}
 
 public:
   const MDNode *getMD() const { return MD; }
@@ -2149,7 +2175,8 @@ class RegisterSDNode : public SDNode {
   Register Reg;
 
   RegisterSDNode(Register reg, EVT VT)
-    : SDNode(ISD::Register, 0, DebugLoc(), getSDVTList(VT)), Reg(reg) {}
+      : SDNode(ISD::Register, 0, DebugLoc(), nullptr, getSDVTList(VT)),
+        Reg(reg) {}
 
 public:
   Register getReg() const { return Reg; }
@@ -2166,7 +2193,8 @@ class RegisterMaskSDNode : public SDNode {
   const uint32_t *RegMask;
 
   RegisterMaskSDNode(const uint32_t *mask)
-    : SDNode(ISD::RegisterMask, 0, DebugLoc(), getSDVTList(MVT::Untyped)),
+      : SDNode(ISD::RegisterMask, 0, DebugLoc(), nullptr,
+               getSDVTList(MVT::Untyped)),
       RegMask(mask) {}
 
 public:
@@ -2186,7 +2214,7 @@ class BlockAddressSDNode : public SDNode {
 
   BlockAddressSDNode(unsigned NodeTy, EVT VT, const BlockAddress *ba,
                      int64_t o, unsigned Flags)
-    : SDNode(NodeTy, 0, DebugLoc(), getSDVTList(VT)),
+    : SDNode(NodeTy, 0, DebugLoc(), nullptr, getSDVTList(VT)),
              BA(ba), Offset(o), TargetFlags(Flags) {}
 
 public:
@@ -2206,7 +2234,7 @@ class LabelSDNode : public SDNode {
   MCSymbol *Label;
 
   LabelSDNode(unsigned Opcode, unsigned Order, const DebugLoc &dl, MCSymbol *L)
-      : SDNode(Opcode, Order, dl, getSDVTList(MVT::Other)), Label(L) {
+      : SDNode(Opcode, Order, dl, nullptr, getSDVTList(MVT::Other)), Label(L) {
     assert(LabelSDNode::classof(this) && "not a label opcode");
   }
 
@@ -2227,7 +2255,7 @@ class ExternalSymbolSDNode : public SDNode {
 
   ExternalSymbolSDNode(bool isTarget, const char *Sym, unsigned TF, EVT VT)
       : SDNode(isTarget ? ISD::TargetExternalSymbol : ISD::ExternalSymbol, 0,
-               DebugLoc(), getSDVTList(VT)),
+               DebugLoc(), nullptr, getSDVTList(VT)),
         Symbol(Sym), TargetFlags(TF) {}
 
 public:
@@ -2246,7 +2274,8 @@ class MCSymbolSDNode : public SDNode {
   MCSymbol *Symbol;
 
   MCSymbolSDNode(MCSymbol *Symbol, EVT VT)
-      : SDNode(ISD::MCSymbol, 0, DebugLoc(), getSDVTList(VT)), Symbol(Symbol) {}
+      : SDNode(ISD::MCSymbol, 0, DebugLoc(), nullptr, getSDVTList(VT)),
+        Symbol(Symbol) {}
 
 public:
   MCSymbol *getMCSymbol() const { return Symbol; }
@@ -2262,7 +2291,7 @@ class CondCodeSDNode : public SDNode {
   ISD::CondCode Condition;
 
   explicit CondCodeSDNode(ISD::CondCode Cond)
-    : SDNode(ISD::CONDCODE, 0, DebugLoc(), getSDVTList(MVT::Other)),
+      : SDNode(ISD::CONDCODE, 0, DebugLoc(), nullptr, getSDVTList(MVT::Other)),
       Condition(Cond) {}
 
 public:
@@ -2281,7 +2310,7 @@ class VTSDNode : public SDNode {
   EVT ValueType;
 
   explicit VTSDNode(EVT VT)
-    : SDNode(ISD::VALUETYPE, 0, DebugLoc(), getSDVTList(MVT::Other)),
+    : SDNode(ISD::VALUETYPE, 0, DebugLoc(), nullptr, getSDVTList(MVT::Other)),
       ValueType(VT) {}
 
 public:
@@ -2296,9 +2325,9 @@ public:
 class LSBaseSDNode : public MemSDNode {
 public:
   LSBaseSDNode(ISD::NodeType NodeTy, unsigned Order, const DebugLoc &dl,
-               SDVTList VTs, ISD::MemIndexedMode AM, EVT MemVT,
+               MDNode *NoSpill, SDVTList VTs, ISD::MemIndexedMode AM, EVT MemVT,
                MachineMemOperand *MMO)
-      : MemSDNode(NodeTy, Order, dl, VTs, MemVT, MMO) {
+      : MemSDNode(NodeTy, Order, dl, NoSpill, VTs, MemVT, MMO) {
     LSBaseSDNodeBits.AddressingMode = AM;
     assert(getAddressingMode() == AM && "Value truncated");
   }
@@ -2329,10 +2358,10 @@ public:
 class LoadSDNode : public LSBaseSDNode {
   friend class SelectionDAG;
 
-  LoadSDNode(unsigned Order, const DebugLoc &dl, SDVTList VTs,
+  LoadSDNode(unsigned Order, const DebugLoc &dl, MDNode *NoSpill, SDVTList VTs,
              ISD::MemIndexedMode AM, ISD::LoadExtType ETy, EVT MemVT,
              MachineMemOperand *MMO)
-      : LSBaseSDNode(ISD::LOAD, Order, dl, VTs, AM, MemVT, MMO) {
+      : LSBaseSDNode(ISD::LOAD, Order, dl, NoSpill, VTs, AM, MemVT, MMO) {
     LoadSDNodeBits.ExtTy = ETy;
     assert(readMem() && "Load MachineMemOperand is not a load!");
     assert(!writeMem() && "Load MachineMemOperand is a store!");
@@ -2357,10 +2386,10 @@ public:
 class StoreSDNode : public LSBaseSDNode {
   friend class SelectionDAG;
 
-  StoreSDNode(unsigned Order, const DebugLoc &dl, SDVTList VTs,
+  StoreSDNode(unsigned Order, const DebugLoc &dl, MDNode *NoSpill, SDVTList VTs,
               ISD::MemIndexedMode AM, bool isTrunc, EVT MemVT,
               MachineMemOperand *MMO)
-      : LSBaseSDNode(ISD::STORE, Order, dl, VTs, AM, MemVT, MMO) {
+      : LSBaseSDNode(ISD::STORE, Order, dl, NoSpill, VTs, AM, MemVT, MMO) {
     StoreSDNodeBits.IsTruncating = isTrunc;
     assert(!readMem() && "Store MachineMemOperand is a load!");
     assert(writeMem() && "Store MachineMemOperand is not a store!");
@@ -2394,7 +2423,7 @@ public:
                         const DebugLoc &DL, SDVTList VTs,
                         ISD::MemIndexedMode AM, EVT MemVT,
                         MachineMemOperand *MMO)
-      : MemSDNode(NodeTy, Order, DL, VTs, MemVT, MMO) {
+      : MemSDNode(NodeTy, Order, DL, nullptr, VTs, MemVT, MMO) {
     LSBaseSDNodeBits.AddressingMode = AM;
     assert(getAddressingMode() == AM && "Value truncated");
   }
@@ -2468,10 +2497,11 @@ class VPLoadSDNode : public VPBaseLoadStoreSDNode {
 public:
   friend class SelectionDAG;
 
-  VPLoadSDNode(unsigned Order, const DebugLoc &dl, SDVTList VTs,
+  VPLoadSDNode(unsigned Order, const DebugLoc &dl, MDNode *NoSpill, SDVTList VTs,
                ISD::MemIndexedMode AM, ISD::LoadExtType ETy, bool isExpanding,
                EVT MemVT, MachineMemOperand *MMO)
       : VPBaseLoadStoreSDNode(ISD::VP_LOAD, Order, dl, VTs, AM, MemVT, MMO) {
+    assert(NoSpill == nullptr && "NoSpill not propagated");
     LoadSDNodeBits.ExtTy = ETy;
     LoadSDNodeBits.IsExpanding = isExpanding;
   }
@@ -2496,11 +2526,13 @@ class VPStridedLoadSDNode : public VPBaseLoadStoreSDNode {
 public:
   friend class SelectionDAG;
 
-  VPStridedLoadSDNode(unsigned Order, const DebugLoc &DL, SDVTList VTs,
-                      ISD::MemIndexedMode AM, ISD::LoadExtType ETy,
-                      bool IsExpanding, EVT MemVT, MachineMemOperand *MMO)
+  VPStridedLoadSDNode(unsigned Order, const DebugLoc &DL, MDNode *NoSpill,
+                      SDVTList VTs, ISD::MemIndexedMode AM,
+                      ISD::LoadExtType ETy, bool IsExpanding, EVT MemVT,
+                      MachineMemOperand *MMO)
       : VPBaseLoadStoreSDNode(ISD::EXPERIMENTAL_VP_STRIDED_LOAD, Order, DL, VTs,
                               AM, MemVT, MMO) {
+    assert(NoSpill == nullptr && "NoSpill not propagated");
     LoadSDNodeBits.ExtTy = ETy;
     LoadSDNodeBits.IsExpanding = IsExpanding;
   }
@@ -2526,10 +2558,11 @@ class VPStoreSDNode : public VPBaseLoadStoreSDNode {
 public:
   friend class SelectionDAG;
 
-  VPStoreSDNode(unsigned Order, const DebugLoc &dl, SDVTList VTs,
-                ISD::MemIndexedMode AM, bool isTrunc, bool isCompressing,
-                EVT MemVT, MachineMemOperand *MMO)
+  VPStoreSDNode(unsigned Order, const DebugLoc &dl, MDNode *NoSpill,
+                SDVTList VTs, ISD::MemIndexedMode AM, bool isTrunc,
+                bool isCompressing, EVT MemVT, MachineMemOperand *MMO)
       : VPBaseLoadStoreSDNode(ISD::VP_STORE, Order, dl, VTs, AM, MemVT, MMO) {
+    assert(NoSpill == nullptr && "NoSpill not propagated");
     StoreSDNodeBits.IsTruncating = isTrunc;
     StoreSDNodeBits.IsCompressing = isCompressing;
   }
@@ -2561,11 +2594,12 @@ class VPStridedStoreSDNode : public VPBaseLoadStoreSDNode {
 public:
   friend class SelectionDAG;
 
-  VPStridedStoreSDNode(unsigned Order, const DebugLoc &DL, SDVTList VTs,
-                       ISD::MemIndexedMode AM, bool IsTrunc, bool IsCompressing,
-                       EVT MemVT, MachineMemOperand *MMO)
+  VPStridedStoreSDNode(unsigned Order, const DebugLoc &DL, MDNode *NoSpill,
+                       SDVTList VTs, ISD::MemIndexedMode AM, bool IsTrunc,
+                       bool IsCompressing, EVT MemVT, MachineMemOperand *MMO)
       : VPBaseLoadStoreSDNode(ISD::EXPERIMENTAL_VP_STRIDED_STORE, Order, DL,
                               VTs, AM, MemVT, MMO) {
+    assert(NoSpill == nullptr && "NoSpill not propagated");
     StoreSDNodeBits.IsTruncating = IsTrunc;
     StoreSDNodeBits.IsCompressing = IsCompressing;
   }
@@ -2602,7 +2636,7 @@ public:
                         const DebugLoc &dl, SDVTList VTs,
                         ISD::MemIndexedMode AM, EVT MemVT,
                         MachineMemOperand *MMO)
-      : MemSDNode(NodeTy, Order, dl, VTs, MemVT, MMO) {
+      : MemSDNode(NodeTy, Order, dl, nullptr, VTs, MemVT, MMO) {
     LSBaseSDNodeBits.AddressingMode = AM;
     assert(getAddressingMode() == AM && "Value truncated");
   }
@@ -2640,10 +2674,11 @@ class MaskedLoadSDNode : public MaskedLoadStoreSDNode {
 public:
   friend class SelectionDAG;
 
-  MaskedLoadSDNode(unsigned Order, const DebugLoc &dl, SDVTList VTs,
-                   ISD::MemIndexedMode AM, ISD::LoadExtType ETy,
+  MaskedLoadSDNode(unsigned Order, const DebugLoc &dl, MDNode *NoSpill,
+                   SDVTList VTs, ISD::MemIndexedMode AM, ISD::LoadExtType ETy,
                    bool IsExpanding, EVT MemVT, MachineMemOperand *MMO)
       : MaskedLoadStoreSDNode(ISD::MLOAD, Order, dl, VTs, AM, MemVT, MMO) {
+    assert(NoSpill == nullptr && "NoSpill not propagated");
     LoadSDNodeBits.ExtTy = ETy;
     LoadSDNodeBits.IsExpanding = IsExpanding;
   }
@@ -2669,10 +2704,11 @@ class MaskedStoreSDNode : public MaskedLoadStoreSDNode {
 public:
   friend class SelectionDAG;
 
-  MaskedStoreSDNode(unsigned Order, const DebugLoc &dl, SDVTList VTs,
-                    ISD::MemIndexedMode AM, bool isTrunc, bool isCompressing,
-                    EVT MemVT, MachineMemOperand *MMO)
+  MaskedStoreSDNode(unsigned Order, const DebugLoc &dl, MDNode *NoSpill,
+                    SDVTList VTs, ISD::MemIndexedMode AM, bool isTrunc,
+                    bool isCompressing, EVT MemVT, MachineMemOperand *MMO)
       : MaskedLoadStoreSDNode(ISD::MSTORE, Order, dl, VTs, AM, MemVT, MMO) {
+    assert(NoSpill == nullptr && "NoSpill not propagated");
     StoreSDNodeBits.IsTruncating = isTrunc;
     StoreSDNodeBits.IsCompressing = isCompressing;
   }
@@ -2708,7 +2744,7 @@ public:
   VPGatherScatterSDNode(ISD::NodeType NodeTy, unsigned Order,
                         const DebugLoc &dl, SDVTList VTs, EVT MemVT,
                         MachineMemOperand *MMO, ISD::MemIndexType IndexType)
-      : MemSDNode(NodeTy, Order, dl, VTs, MemVT, MMO) {
+      : MemSDNode(NodeTy, Order, dl, nullptr, VTs, MemVT, MMO) {
     LSBaseSDNodeBits.AddressingMode = IndexType;
     assert(getIndexType() == IndexType && "Value truncated");
   }
@@ -2754,10 +2790,13 @@ class VPGatherSDNode : public VPGatherScatterSDNode {
 public:
   friend class SelectionDAG;
 
-  VPGatherSDNode(unsigned Order, const DebugLoc &dl, SDVTList VTs, EVT MemVT,
-                 MachineMemOperand *MMO, ISD::MemIndexType IndexType)
+  VPGatherSDNode(unsigned Order, const DebugLoc &dl, MDNode *NoSpill,
+                 SDVTList VTs, EVT MemVT, MachineMemOperand *MMO,
+                 ISD::MemIndexType IndexType)
       : VPGatherScatterSDNode(ISD::VP_GATHER, Order, dl, VTs, MemVT, MMO,
-                              IndexType) {}
+                              IndexType) {
+    assert(NoSpill == nullptr && "NoSpill not propagated");
+  }
 
   static bool classof(const SDNode *N) {
     return N->getOpcode() == ISD::VP_GATHER;
@@ -2770,10 +2809,13 @@ class VPScatterSDNode : public VPGatherScatterSDNode {
 public:
   friend class SelectionDAG;
 
-  VPScatterSDNode(unsigned Order, const DebugLoc &dl, SDVTList VTs, EVT MemVT,
-                  MachineMemOperand *MMO, ISD::MemIndexType IndexType)
+  VPScatterSDNode(unsigned Order, const DebugLoc &dl, MDNode *NoSpill,
+                  SDVTList VTs, EVT MemVT, MachineMemOperand *MMO,
+                  ISD::MemIndexType IndexType)
       : VPGatherScatterSDNode(ISD::VP_SCATTER, Order, dl, VTs, MemVT, MMO,
-                              IndexType) {}
+                              IndexType) {
+    assert(NoSpill == nullptr && "NoSpill not propagated");
+  }
 
   const SDValue &getValue() const { return getOperand(1); }
 
@@ -2792,7 +2834,7 @@ public:
   MaskedGatherScatterSDNode(ISD::NodeType NodeTy, unsigned Order,
                             const DebugLoc &dl, SDVTList VTs, EVT MemVT,
                             MachineMemOperand *MMO, ISD::MemIndexType IndexType)
-      : MemSDNode(NodeTy, Order, dl, VTs, MemVT, MMO) {
+      : MemSDNode(NodeTy, Order, dl, nullptr, VTs, MemVT, MMO) {
     LSBaseSDNodeBits.AddressingMode = IndexType;
     assert(getIndexType() == IndexType && "Value truncated");
   }
@@ -2827,11 +2869,12 @@ class MaskedGatherSDNode : public MaskedGatherScatterSDNode {
 public:
   friend class SelectionDAG;
 
-  MaskedGatherSDNode(unsigned Order, const DebugLoc &dl, SDVTList VTs,
-                     EVT MemVT, MachineMemOperand *MMO,
+  MaskedGatherSDNode(unsigned Order, const DebugLoc &dl, MDNode *NoSpill,
+                     SDVTList VTs, EVT MemVT, MachineMemOperand *MMO,
                      ISD::MemIndexType IndexType, ISD::LoadExtType ETy)
       : MaskedGatherScatterSDNode(ISD::MGATHER, Order, dl, VTs, MemVT, MMO,
                                   IndexType) {
+    assert(NoSpill == nullptr && "NoSpill not propagated");
     LoadSDNodeBits.ExtTy = ETy;
   }
 
@@ -2852,11 +2895,12 @@ class MaskedScatterSDNode : public MaskedGatherScatterSDNode {
 public:
   friend class SelectionDAG;
 
-  MaskedScatterSDNode(unsigned Order, const DebugLoc &dl, SDVTList VTs,
-                      EVT MemVT, MachineMemOperand *MMO,
+  MaskedScatterSDNode(unsigned Order, const DebugLoc &dl, MDNode *NoSpill,
+                      SDVTList VTs, EVT MemVT, MachineMemOperand *MMO,
                       ISD::MemIndexType IndexType, bool IsTrunc)
       : MaskedGatherScatterSDNode(ISD::MSCATTER, Order, dl, VTs, MemVT, MMO,
                                   IndexType) {
+    assert(NoSpill == nullptr && "NoSpill not propagated");
     StoreSDNodeBits.IsTruncating = IsTrunc;
   }
 
@@ -2883,8 +2927,9 @@ class MachineSDNode : public SDNode {
 private:
   friend class SelectionDAG;
 
-  MachineSDNode(unsigned Opc, unsigned Order, const DebugLoc &DL, SDVTList VTs)
-      : SDNode(Opc, Order, DL, VTs) {}
+  MachineSDNode(unsigned Opc, unsigned Order, const DebugLoc &DL,
+                MDNode *NoSpill, SDVTList VTs)
+      : SDNode(Opc, Order, DL, NoSpill, VTs) {}
 
   // We use a pointer union between a single `MachineMemOperand` pointer and
   // a pointer to an array of `MachineMemOperand` pointers. This is null when
@@ -2943,7 +2988,8 @@ class AssertAlignSDNode : public SDNode {
 
 public:
   AssertAlignSDNode(unsigned Order, const DebugLoc &DL, EVT VT, Align A)
-      : SDNode(ISD::AssertAlign, Order, DL, getSDVTList(VT)), Alignment(A) {}
+      : SDNode(ISD::AssertAlign, Order, DL, nullptr, getSDVTList(VT)),
+        Alignment(A) {}
 
   Align getAlign() const { return Alignment; }
 

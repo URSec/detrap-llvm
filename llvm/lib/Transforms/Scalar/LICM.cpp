@@ -902,7 +902,10 @@ bool llvm::hoistRegion(DomTreeNode *N, AAResults *AA, LoopInfo *LI,
           canSinkOrHoistInst(I, AA, DT, CurLoop, MSSAU, true, Flags, ORE) &&
           isSafeToExecuteUnconditionally(
               I, DT, TLI, CurLoop, SafetyInfo, ORE,
-              CurLoop->getLoopPreheader()->getTerminator(), AllowSpeculation)) {
+              CurLoop->getLoopPreheader()->getTerminator(), AllowSpeculation) &&
+          // For now, all NoSpills are not hoistable; once implemented, proper
+          // analysis might permit some hoisting.
+          !I.hasMetadata(LLVMContext::MD_nospill)) {
         hoist(I, DT, CurLoop, CFH.getOrCreateHoistedBlock(BB), SafetyInfo,
               MSSAU, SE, ORE);
         HoistedInstructions.push_back(&I);
@@ -1702,6 +1705,8 @@ static void hoist(Instruction &I, const DominatorTree *DT, const Loop *CurLoop,
     return OptimizationRemark(DEBUG_TYPE, "Hoisted", &I) << "hoisting "
                                                          << ore::NV("Inst", &I);
   });
+  assert(I.getMetadata(LLVMContext::MD_nospill) == nullptr &&
+         "Trying to hoist NoSpill!");
 
   // Metadata can be dependent on conditions we are hoisting above.
   // Conservatively strip all metadata on the instruction unless we were

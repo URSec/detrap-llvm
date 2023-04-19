@@ -52,6 +52,9 @@ struct MachineIRBuilderState {
   DebugLoc DL;
   /// PC sections metadata to be set to any instruction we create.
   MDNode *PCSections = nullptr;
+  /// Mark instruction as having a result that is not safe to spill
+  /// TODO: will eventually identify consuming instruction
+  MDNode *NoSpill = nullptr;
 
   /// \name Fields describing the insertion point.
   /// @{
@@ -344,6 +347,7 @@ public:
     setMBB(*MI.getParent());
     State.II = MI.getIterator();
     setPCSections(MI.getPCSections());
+    setNoSpill(MI.getNoSpill());
   }
   /// @}
 
@@ -372,6 +376,12 @@ public:
 
   /// Get the current instruction's PC sections metadata.
   MDNode *getPCSections() { return State.PCSections; }
+
+  /// Set the NoSpill metadata to \p MD for all the next build instructions.
+  void setNoSpill(MDNode *MD) { State.NoSpill = MD; }
+
+  /// Get the current instruction's NoSpill metadata.
+  MDNode *getNoSpill() { return State.NoSpill; }
 
   /// Build and insert <empty> = \p Opcode <empty>.
   /// The insertion point is the one set by the last call of either

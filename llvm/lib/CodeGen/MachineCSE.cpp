@@ -577,6 +577,11 @@ bool MachineCSE::ProcessBlockCSE(MachineBasicBlock *MBB) {
       }
     }
 
+    // If the instruction is nospill, it's not safe to replace.
+    if(FoundCSE && MI.getNoSpill())
+      //TODO: run analysis to confirm this
+      FoundCSE = false;
+
     if (!FoundCSE) {
       VNT.insert(&MI, CurrVN++);
       Exps.push_back(&MI);

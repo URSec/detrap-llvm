@@ -1101,6 +1101,9 @@ bool TargetPassConfig::addCoreISelPasses() {
   // FinalizeISel.
   addPass(&FinalizeISelID);
 
+  // Do NoSpill Checks
+  addPass(&NoSpillNoStoreID);
+
   // Print the instruction selected machine code...
   printAndVerify("After Instruction Selection");
 

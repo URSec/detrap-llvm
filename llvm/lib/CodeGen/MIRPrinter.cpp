@@ -826,6 +826,13 @@ void MIPrinter::print(const MachineInstr &MI) {
     PCSections->printAsOperand(OS, MST);
     NeedComma = true;
   }
+  if (MDNode *NoSpill = MI.getNoSpill()) {
+    if (NeedComma)
+      OS << ',';
+    OS << " nospill ";
+    NoSpill->printAsOperand(OS, MST);
+    NeedComma = true;
+  }
   if (uint32_t CFIType = MI.getCFIType()) {
     if (NeedComma)
       OS << ',';

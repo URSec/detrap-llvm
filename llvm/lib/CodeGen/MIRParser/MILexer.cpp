@@ -272,6 +272,7 @@ static MIToken::TokenKind getIdentifierKind(StringRef Identifier) {
       .Case("post-instr-symbol", MIToken::kw_post_instr_symbol)
       .Case("heap-alloc-marker", MIToken::kw_heap_alloc_marker)
       .Case("pcsections", MIToken::kw_pcsections)
+      .Case("nospill", MIToken::kw_nospill)
       .Case("cfi-type", MIToken::kw_cfi_type)
       .Case("bbsections", MIToken::kw_bbsections)
       .Case("unknown-size", MIToken::kw_unknown_size)

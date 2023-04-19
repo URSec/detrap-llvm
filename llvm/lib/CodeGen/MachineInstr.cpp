@@ -301,15 +301,16 @@ void MachineInstr::setExtraInfo(MachineFunction &MF,
                                 ArrayRef<MachineMemOperand *> MMOs,
                                 MCSymbol *PreInstrSymbol,
                                 MCSymbol *PostInstrSymbol,
-                                MDNode *HeapAllocMarker, MDNode *PCSections,
+                                MDNode *HeapAllocMarker, MDNode *PCSections, MDNode *NoSpill,
                                 uint32_t CFIType) {
   bool HasPreInstrSymbol = PreInstrSymbol != nullptr;
   bool HasPostInstrSymbol = PostInstrSymbol != nullptr;
   bool HasHeapAllocMarker = HeapAllocMarker != nullptr;
   bool HasPCSections = PCSections != nullptr;
+  bool HasNoSpill = NoSpill != nullptr;
   bool HasCFIType = CFIType != 0;
   int NumPointers = MMOs.size() + HasPreInstrSymbol + HasPostInstrSymbol +
-                    HasHeapAllocMarker + HasPCSections + HasCFIType;
+                    HasHeapAllocMarker + HasPCSections + HasNoSpill + HasCFIType;
 
   // Drop all extra info if there is none.
   if (NumPointers <= 0) {
@@ -322,10 +323,10 @@ void MachineInstr::setExtraInfo(MachineFunction &MF,
   // 32-bit pointers.
   // FIXME: Maybe we should make the symbols in the extra info mutable?
   else if (NumPointers > 1 || HasHeapAllocMarker || HasPCSections ||
-           HasCFIType) {
+           HasNoSpill || HasCFIType) {
     Info.set<EIIK_OutOfLine>(
         MF.createMIExtraInfo(MMOs, PreInstrSymbol, PostInstrSymbol,
-                             HeapAllocMarker, PCSections, CFIType));
+                             HeapAllocMarker, PCSections, NoSpill, CFIType));
     return;
   }
 
@@ -343,7 +344,8 @@ void MachineInstr::dropMemRefs(MachineFunction &MF) {
     return;
 
   setExtraInfo(MF, {}, getPreInstrSymbol(), getPostInstrSymbol(),
-               getHeapAllocMarker(), getPCSections(), getCFIType());
+               getHeapAllocMarker(), getPCSections(), getNoSpill(),
+               getCFIType());
 }
 
 void MachineInstr::setMemRefs(MachineFunction &MF,
@@ -354,7 +356,8 @@ void MachineInstr::setMemRefs(MachineFunction &MF,
   }
 
   setExtraInfo(MF, MMOs, getPreInstrSymbol(), getPostInstrSymbol(),
-               getHeapAllocMarker(), getPCSections(), getCFIType());
+               getHeapAllocMarker(), getPCSections(), getNoSpill(),
+               getCFIType());
 }
 
 void MachineInstr::addMemOperand(MachineFunction &MF,
@@ -463,7 +466,8 @@ void MachineInstr::setPreInstrSymbol(MachineFunction &MF, MCSymbol *Symbol) {
   }
 
   setExtraInfo(MF, memoperands(), Symbol, getPostInstrSymbol(),
-               getHeapAllocMarker(), getPCSections(), getCFIType());
+               getHeapAllocMarker(), getPCSections(), getNoSpill(),
+               getCFIType());
 }
 
 void MachineInstr::setPostInstrSymbol(MachineFunction &MF, MCSymbol *Symbol) {
@@ -478,7 +482,8 @@ void MachineInstr::setPostInstrSymbol(MachineFunction &MF, MCSymbol *Symbol) {
   }
 
   setExtraInfo(MF, memoperands(), getPreInstrSymbol(), Symbol,
-               getHeapAllocMarker(), getPCSections(), getCFIType());
+               getHeapAllocMarker(), getPCSections(), getNoSpill(),
+               getCFIType());
 }
 
 void MachineInstr::setHeapAllocMarker(MachineFunction &MF, MDNode *Marker) {
@@ -487,7 +492,7 @@ void MachineInstr::setHeapAllocMarker(MachineFunction &MF, MDNode *Marker) {
     return;
 
   setExtraInfo(MF, memoperands(), getPreInstrSymbol(), getPostInstrSymbol(),
-               Marker, getPCSections(), getCFIType());
+               Marker, getPCSections(), getNoSpill(), getCFIType());
 }
 
 void MachineInstr::setPCSections(MachineFunction &MF, MDNode *PCSections) {
@@ -496,7 +501,16 @@ void MachineInstr::setPCSections(MachineFunction &MF, MDNode *PCSections) {
     return;
 
   setExtraInfo(MF, memoperands(), getPreInstrSymbol(), getPostInstrSymbol(),
-               getHeapAllocMarker(), PCSections, getCFIType());
+               getHeapAllocMarker(), PCSections, getNoSpill(), getCFIType());
+}
+
+void MachineInstr::setNoSpill(MachineFunction &MF, MDNode *NoSpill) {
+  // Do nothing if old and new values are the same.
+  if(NoSpill == getNoSpill())
+    return;
+
+  setExtraInfo(MF, memoperands(), getPreInstrSymbol(), getPostInstrSymbol(),
+               getHeapAllocMarker(), getPCSections(), NoSpill, getCFIType());
 }
 
 void MachineInstr::setCFIType(MachineFunction &MF, uint32_t Type) {
@@ -505,7 +519,7 @@ void MachineInstr::setCFIType(MachineFunction &MF, uint32_t Type) {
     return;
 
   setExtraInfo(MF, memoperands(), getPreInstrSymbol(), getPostInstrSymbol(),
-               getHeapAllocMarker(), getPCSections(), Type);
+               getHeapAllocMarker(), getPCSections(), getNoSpill(), Type);
 }
 
 void MachineInstr::cloneInstrSymbols(MachineFunction &MF,
@@ -521,6 +535,7 @@ void MachineInstr::cloneInstrSymbols(MachineFunction &MF,
   setPostInstrSymbol(MF, MI.getPostInstrSymbol());
   setHeapAllocMarker(MF, MI.getHeapAllocMarker());
   setPCSections(MF, MI.getPCSections());
+  setNoSpill(MF, MI.getNoSpill());
 }
 
 uint16_t MachineInstr::mergeFlagsWith(const MachineInstr &Other) const {
@@ -1784,6 +1799,13 @@ void MachineInstr::print(raw_ostream &OS, ModuleSlotTracker &MST,
     }
     OS << " pcsections ";
     PCSections->printAsOperand(OS, MST);
+  }
+  if(bool NoSpill = getNoSpill()) {
+    if (!FirstOp) {
+      FirstOp = false;
+      OS << ',';
+    }
+    OS << " nospill";
   }
   if (uint32_t CFIType = getCFIType()) {
     if (!FirstOp)

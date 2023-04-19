@@ -87,6 +87,7 @@ void llvm::initializeCodeGen(PassRegistry &Registry) {
   initializeMachineSchedulerPass(Registry);
   initializeMachineSinkingPass(Registry);
   initializeMachineVerifierPassPass(Registry);
+  initializeNoSpillNoStorePass(Registry);
   initializeOptimizePHIsPass(Registry);
   initializePEIPass(Registry);
   initializePHIEliminationPass(Registry);

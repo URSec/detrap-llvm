@@ -3524,10 +3524,11 @@ void CodeGenFunction::EmitCfiCheckFail() {
   llvm::Value *AllVtables = llvm::MetadataAsValue::get(
       CGM.getLLVMContext(),
       llvm::MDString::get(CGM.getLLVMContext(), "all-vtables"));
-  llvm::Value *ValidVtable = Builder.CreateZExt(
-      Builder.CreateCall(CGM.getIntrinsic(llvm::Intrinsic::type_test),
-                         {Addr, AllVtables}),
-      IntPtrTy);
+  llvm::CallInst *TestCall = Builder.CreateCall(
+      CGM.getIntrinsic(llvm::Intrinsic::type_test), {Addr, AllVtables});
+  TestCall->setMetadata(llvm::LLVMContext::MD_nospill,
+                        llvm::MDNode::get(CGM.getLLVMContext(), None));
+  llvm::Value *ValidVtable = Builder.CreateZExt(TestCall, IntPtrTy);
 
   const std::pair<int, SanitizerMask> CheckKinds[] = {
       {CFITCK_VCall, SanitizerKind::CFIVCall},
@@ -5397,6 +5398,9 @@ RValue CodeGenFunction::EmitCall(QualType CalleeType, const CGCallee &OrigCallee
     llvm::Value *CastedCallee = Builder.CreateBitCast(CalleePtr, Int8PtrTy);
     llvm::Value *TypeTest = Builder.CreateCall(
         CGM.getIntrinsic(llvm::Intrinsic::type_test), {CastedCallee, TypeId});
+    cast<llvm::CallInst>(TypeTest)->setMetadata(
+        llvm::LLVMContext::MD_nospill,
+        llvm::MDNode::get(CGM.getLLVMContext(), None));
 
     auto CrossDsoTypeId = CGM.CreateCrossDsoCfiTypeId(MD);
     llvm::Constant *StaticData[] = {

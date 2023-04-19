@@ -129,7 +129,8 @@ private:
 struct ReplacementIRBuilder : IRBuilder<> {
   // Preserves the DebugLoc from I, and preserves still valid metadata.
   explicit ReplacementIRBuilder(Instruction *I) : IRBuilder<>(I) {
-    this->CollectMetadataToCopy(I, {LLVMContext::MD_pcsections});
+    this->CollectMetadataToCopy(
+        I, {LLVMContext::MD_pcsections, LLVMContext::MD_nospill});
   }
 };
 

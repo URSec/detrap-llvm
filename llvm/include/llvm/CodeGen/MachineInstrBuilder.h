@@ -316,6 +316,12 @@ public:
     return *this;
   }
 
+  const MachineInstrBuilder &setNoSpill(MDNode *MD) const {
+    if (MD)
+      MI->setNoSpill(*MF, MD);
+    return *this;
+  }
+
   /// Copy all the implicit operands from OtherMI onto this one.
   const MachineInstrBuilder &
   copyImplicitOps(const MachineInstr &OtherMI) const {
@@ -335,29 +341,32 @@ public:
 class MIMetadata {
 public:
   MIMetadata() = default;
-  MIMetadata(DebugLoc DL, MDNode *PCSections = nullptr)
-      : DL(std::move(DL)), PCSections(PCSections) {}
-  MIMetadata(const DILocation *DI, MDNode *PCSections = nullptr)
-      : DL(DI), PCSections(PCSections) {}
+  MIMetadata(DebugLoc DL, MDNode *PCSections = nullptr, MDNode *NoSpill = nullptr)
+      : DL(std::move(DL)), PCSections(PCSections), NoSpill(NoSpill) {}
+  MIMetadata(const DILocation *DI, MDNode *PCSections = nullptr, MDNode *NoSpill = nullptr)
+      : DL(DI), PCSections(PCSections), NoSpill(NoSpill) {}
   explicit MIMetadata(const Instruction &From)
       : DL(From.getDebugLoc()),
-        PCSections(From.getMetadata(LLVMContext::MD_pcsections)) {}
+        PCSections(From.getMetadata(LLVMContext::MD_pcsections)),
+        NoSpill(From.getMetadata(LLVMContext::MD_nospill)) {}
   explicit MIMetadata(const MachineInstr &From)
-      : DL(From.getDebugLoc()), PCSections(From.getPCSections()) {}
+      : DL(From.getDebugLoc()), PCSections(From.getPCSections()), NoSpill(From.getNoSpill()) {}
 
   const DebugLoc &getDL() const { return DL; }
   MDNode *getPCSections() const { return PCSections; }
+  MDNode *getNoSpill() const { return NoSpill; }
 
 private:
   DebugLoc DL;
   MDNode *PCSections = nullptr;
+  MDNode *NoSpill = nullptr;
 };
 
 /// Builder interface. Specify how to create the initial instruction itself.
 inline MachineInstrBuilder BuildMI(MachineFunction &MF, const MIMetadata &MIMD,
                                    const MCInstrDesc &MCID) {
   return MachineInstrBuilder(MF, MF.CreateMachineInstr(MCID, MIMD.getDL()))
-           .setPCSections(MIMD.getPCSections());
+           .setPCSections(MIMD.getPCSections()).setNoSpill(MIMD.getNoSpill());
 }
 
 /// This version of the builder sets up the first operand as a
@@ -365,7 +374,7 @@ inline MachineInstrBuilder BuildMI(MachineFunction &MF, const MIMetadata &MIMD,
 inline MachineInstrBuilder BuildMI(MachineFunction &MF, const MIMetadata &MIMD,
                                    const MCInstrDesc &MCID, Register DestReg) {
   return MachineInstrBuilder(MF, MF.CreateMachineInstr(MCID, MIMD.getDL()))
-           .setPCSections(MIMD.getPCSections())
+           .setPCSections(MIMD.getPCSections()).setNoSpill(MIMD.getNoSpill())
            .addReg(DestReg, RegState::Define);
 }
 
@@ -380,7 +389,7 @@ inline MachineInstrBuilder BuildMI(MachineBasicBlock &BB,
   MachineInstr *MI = MF.CreateMachineInstr(MCID, MIMD.getDL());
   BB.insert(I, MI);
   return MachineInstrBuilder(MF, MI)
-           .setPCSections(MIMD.getPCSections())
+           .setPCSections(MIMD.getPCSections()).setNoSpill(MIMD.getNoSpill())
            .addReg(DestReg, RegState::Define);
 }
 
@@ -398,7 +407,7 @@ inline MachineInstrBuilder BuildMI(MachineBasicBlock &BB,
   MachineInstr *MI = MF.CreateMachineInstr(MCID, MIMD.getDL());
   BB.insert(I, MI);
   return MachineInstrBuilder(MF, MI)
-           .setPCSections(MIMD.getPCSections())
+           .setPCSections(MIMD.getPCSections()).setNoSpill(MIMD.getNoSpill())
            .addReg(DestReg, RegState::Define);
 }
 
@@ -429,7 +438,7 @@ inline MachineInstrBuilder BuildMI(MachineBasicBlock &BB,
   MachineFunction &MF = *BB.getParent();
   MachineInstr *MI = MF.CreateMachineInstr(MCID, MIMD.getDL());
   BB.insert(I, MI);
-  return MachineInstrBuilder(MF, MI).setPCSections(MIMD.getPCSections());
+  return MachineInstrBuilder(MF, MI).setPCSections(MIMD.getPCSections()).setNoSpill(MIMD.getNoSpill());
 }
 
 inline MachineInstrBuilder BuildMI(MachineBasicBlock &BB,
@@ -439,7 +448,7 @@ inline MachineInstrBuilder BuildMI(MachineBasicBlock &BB,
   MachineFunction &MF = *BB.getParent();
   MachineInstr *MI = MF.CreateMachineInstr(MCID, MIMD.getDL());
   BB.insert(I, MI);
-  return MachineInstrBuilder(MF, MI).setPCSections(MIMD.getPCSections());
+  return MachineInstrBuilder(MF, MI).setPCSections(MIMD.getPCSections()).setNoSpill(MIMD.getNoSpill());
 }
 
 inline MachineInstrBuilder BuildMI(MachineBasicBlock &BB, MachineInstr &I,

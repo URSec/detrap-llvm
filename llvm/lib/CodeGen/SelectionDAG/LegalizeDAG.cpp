@@ -208,12 +208,20 @@ public:
            "Replacing one node with another that produces a different number "
            "of values!");
     DAG.ReplaceAllUsesWith(Old, New);
+
+    assert(!Old->getNoSpill() && "Replacing NoSpill Node");
+
     if (UpdatedNodes)
       UpdatedNodes->insert(New);
     ReplacedNode(Old);
   }
 
   void ReplaceNode(SDValue Old, SDValue New) {
+    if(Old->getNoSpill() && !New->getNoSpill()) {
+      LLVM_DEBUG(Old->dump(&DAG); New->dump(&DAG));
+      assert(false && "Replacing NoSpill Value");
+    }
+
     LLVM_DEBUG(dbgs() << " ... replacing: "; Old->dump(&DAG);
                dbgs() << "     with:      "; New->dump(&DAG));
 
@@ -225,6 +233,11 @@ public:
 
   void ReplaceNode(SDNode *Old, const SDValue *New) {
     LLVM_DEBUG(dbgs() << " ... replacing: "; Old->dump(&DAG));
+
+    if(Old->getNoSpill() && !New->getNode()->getNoSpill()) {
+      LLVM_DEBUG(Old->dump(&DAG); New->dump(&DAG));
+      assert(false && "Replacing NoSpill Node with Value");
+    }
 
     DAG.ReplaceAllUsesWith(Old, New);
     for (unsigned i = 0, e = Old->getNumValues(); i != e; ++i) {
@@ -239,6 +252,8 @@ public:
   void ReplaceNodeWithValue(SDValue Old, SDValue New) {
     LLVM_DEBUG(dbgs() << " ... replacing: "; Old->dump(&DAG);
                dbgs() << "     with:      "; New->dump(&DAG));
+
+    assert(!Old.getNode()->getNoSpill() && "Replacing NoSpill Value");
 
     DAG.ReplaceAllUsesOfValueWith(Old, New);
     if (UpdatedNodes)

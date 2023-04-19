@@ -817,6 +817,8 @@ Error CodeGenPassBuilder<Derived>::addCoreISelPasses(
   // FinalizeISel.
   addPass(FinalizeISelPass());
 
+  addPass(NoSpillNoStorePass());
+
   // // Print the instruction selected machine code...
   // printAndVerify("After Instruction Selection");
 

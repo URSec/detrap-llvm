@@ -1080,6 +1080,9 @@ static void emitComments(const MachineInstr &MI, raw_ostream &CommentOS) {
   // Check for spill-induced copies
   if (MI.getAsmPrinterFlag(MachineInstr::ReloadReuse))
     CommentOS << " Reload Reuse\n";
+  
+  if (MI.getNoSpill())
+    CommentOS << " NoSpill\n";
 }
 
 /// emitImplicitDef - This method emits the specified machine instruction

@@ -149,6 +149,7 @@ add_llvm_component_library(LLVMCodeGen
   MIRPrintingPass.cpp
   MacroFusion.cpp
   NonRelocatableStringpool.cpp
+  NoSpillNoStore.cpp
   OptimizePHIs.cpp
   ParallelCG.cpp
   PeepholeOptimizer.cpp

@@ -390,6 +390,8 @@ namespace llvm {
   /// machine frame information.
   extern char &FinalizeISelID;
 
+  extern char &NoSpillNoStoreID;
+
   /// UnpackMachineBundles - This pass unpack machine instruction bundles.
   extern char &UnpackMachineBundlesID;
 
