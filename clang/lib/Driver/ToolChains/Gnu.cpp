@@ -1683,8 +1683,8 @@ static void findRISCVBareMetalMultilibs(const Driver &D,
   // TODO: support MULTILIB_REUSE
   constexpr RiscvMultilib RISCVMultilibSet[] = {
       {"rv32i", "ilp32"},     {"rv32im", "ilp32"},     {"rv32iac", "ilp32"},
-      {"rv32imac", "ilp32"},  {"rv32imafc", "ilp32f"}, {"rv64imac", "lp64"},
-      {"rv64imafdc", "lp64d"}};
+      {"rv32imac", "ilp32"},  {"rv32imafc", "ilp32f"}, {"rv32imafdc", "ilp32d"},
+      {"rv64imac", "lp64"},   {"rv64imafdc", "lp64d"}};
 
   std::vector<Multilib> Ms;
   for (auto Element : RISCVMultilibSet) {

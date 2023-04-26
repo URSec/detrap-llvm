@@ -40,7 +40,7 @@ static bool findRISCVMultilibs(const Driver &D,
   StringRef Abi = tools::riscv::getRISCVABI(Args, TargetTriple);
 
   if (TargetTriple.getArch() == llvm::Triple::riscv64) {
-    Multilib Imac = makeMultilib("").flag("+march=rv64imac").flag("+mabi=lp64");
+    Multilib Imac = makeMultilib("/rv64imac/lp64").flag("+march=rv64imac").flag("+mabi=lp64");
     Multilib Imafdc = makeMultilib("/rv64imafdc/lp64d")
                           .flag("+march=rv64imafdc")
                           .flag("+mabi=lp64d");
@@ -59,7 +59,7 @@ static bool findRISCVMultilibs(const Driver &D,
   }
   if (TargetTriple.getArch() == llvm::Triple::riscv32) {
     Multilib Imac =
-        makeMultilib("").flag("+march=rv32imac").flag("+mabi=ilp32");
+        makeMultilib("/rv32imac/ilp32").flag("+march=rv32imac").flag("+mabi=ilp32");
     Multilib I =
         makeMultilib("/rv32i/ilp32").flag("+march=rv32i").flag("+mabi=ilp32");
     Multilib Im =
@@ -88,6 +88,7 @@ static bool findRISCVMultilibs(const Driver &D,
     addMultilibFlag((Arch == "rv32imafdc"), "march=rv32imafdc", Flags);
     addMultilibFlag(Abi == "ilp32", "mabi=ilp32", Flags);
     addMultilibFlag(Abi == "ilp32f", "mabi=ilp32f", Flags);
+    addMultilibFlag(Abi == "ilp32d", "mabi=ilp32d", Flags);
 
     Result.Multilibs = MultilibSet().Either({I, Im, Iac, Imac, Imafc, Imafdc});
     return Result.Multilibs.select(Flags, Result.SelectedMultilib);
