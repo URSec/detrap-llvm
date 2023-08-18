@@ -47,7 +47,11 @@ enum NSNSAction { NONE, WARNING, ERROR, FIX };
 static cl::opt<NSNSAction>
     ClNSNSAction("nospill-nostore",
                  cl::desc("Action to take in nospill-nostore pass"), cl::Hidden,
+#ifdef NDEBUG
+                 cl::init(NONE),
+#else
                  cl::init(WARNING),
+#endif
                  cl::values(clEnumValN(NONE, "none", "nothing"),
                             clEnumValN(WARNING, "warning", "warning"),
                             clEnumValN(ERROR, "error", "error"),
